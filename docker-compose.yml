@@ -1,0 +1,159 @@
+#version: '3.8'
+
+services:
+  # GPU工作区间 - 完整开发环境
+  gpu-workspace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: gpu-workspace
+    hostname: gpu-server
+    stdin_open: true
+    tty: true
+    
+    # GPU配置
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # 端口映射 - 可视化和服务
+    ports:
+      - "8887:8888"   # Jupyter Lab
+      - "6009:6006"   # TensorBoard
+      - "8081:8080"   # 可视化服务
+      - "5000:5000"   # Flask/Streamlit
+      - "8050:8050"   # Dash
+      - "8501:8501"   # Streamlit默认端口
+    
+    # 文件系统挂载
+    volumes:
+      # 挂载你的主目录
+      - /home/ma23035:/host-home/ma23035
+      # 挂载整个home目录（备用）
+      - /home:/host-home
+      # 项目工作空间
+      - .:/workspace
+      # 系统级目录（可选）
+      - /tmp:/host-tmp
+      - /var/tmp:/host-var-tmp
+      # X11支持（可视化）
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev/dri:/dev/dri
+    
+    # 工作目录
+    working_dir: /workspace
+    
+    # 环境变量
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+      - JUPYTER_ENABLE_LAB=yes
+      - PYTHONPATH=/workspace:/host-home/ma23035
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/tmp/.docker.xauth
+    
+    # 系统配置
+    shm_size: 16g
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    
+    # 网络
+    networks:
+      - pointcloud-network
+    
+    # 启动命令
+    command: /bin/bash
+    
+    # 设备访问
+    devices:
+      - /dev/dri:/dev/dri
+    
+    # 特权模式（如果需要完整硬件访问）
+    privileged: false
+    
+    # 用户配置
+    user: "1000:1000"
+
+  # 独立的Jupyter服务
+  jupyter-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pointcloud-jupyter
+    ports:
+      - "8889:8888"
+    volumes:
+      - /home/ma23035:/host-home/ma23035
+      - .:/workspace
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - PYTHONPATH=/workspace:/host-home/ma23035
+    working_dir: /workspace
+    command: >
+      jupyter lab 
+      --ip=0.0.0.0 
+      --port=8888 
+      --no-browser 
+      --allow-root 
+      --NotebookApp.token='' 
+      --NotebookApp.password=''
+      --ServerApp.allow_origin='*'
+      --ServerApp.allow_remote_access=True
+    networks:
+      - pointcloud-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # TensorBoard服务
+  tensorboard-service:
+    image: tensorflow/tensorflow:latest-gpu
+    container_name: pointcloud-tensorboard
+    ports:
+      - "6007:6006"
+    volumes:
+      - /home/ma23035:/host-home/ma23035
+      - ./logs:/logs
+      - ./experiments:/experiments
+    command: >
+      tensorboard 
+      --logdir=/logs 
+      --host=0.0.0.0 
+      --port=6006 
+      --bind_all
+      --reload_interval=30
+    networks:
+      - pointcloud-network
+
+networks:
+  pointcloud-network:
+    driver: bridge
+
+# 预设配置
+x-gpu-config: &gpu-config
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+x-common-volumes: &common-volumes
+  - /home/ma23035:/host-home/ma23035
+  - .:/workspace
+
+x-common-env: &common-env
+  PYTHONPATH: /workspace:/host-home/ma23035
+  NVIDIA_VISIBLE_DEVICES: all
+  CUDA_VISIBLE_DEVICES: 0
