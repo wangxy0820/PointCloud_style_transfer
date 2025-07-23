@@ -36,7 +36,7 @@ class DiffusionTester:
         """加载模型"""
         print(f"Loading model from {checkpoint_path}")
         
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.config = checkpoint['config']
         
         # 初始化模型

@@ -185,10 +185,10 @@ python scripts/inference.py \
 批量处理：
 ```bash
 python scripts/inference.py \
-    --checkpoint checkpoints/best_model.pth \
-    --sim_folder path/to/sim_folder \
-    --real_reference path/to/real_reference.npy \
-    --output_folder path/to/output_folder \
+    --checkpoint experiments/my_experiment/checkpoints/best_model.pth \
+    --sim_input datasets/test \
+    --real_reference datasets/real_world/000000.npy \
+    --output datasets/result \
     --batch_process
 ```
 

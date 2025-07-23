@@ -70,7 +70,7 @@ def main():
     
     print("Loading checkpoint...")
     # 加载检查点
-    checkpoint = torch.load(args.checkpoint, map_location=args.device)
+    checkpoint = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     config = checkpoint['config']
     
     # 创建测试器

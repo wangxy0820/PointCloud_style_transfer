@@ -72,13 +72,13 @@ def main():
             # 原始点云
             ax1 = fig.add_subplot(121, projection='3d')
             ax1.scatter(orig_sample[:, 0], orig_sample[:, 1], orig_sample[:, 2],
-                       c=[0.1, 0.1, 0.8], s=1, alpha=0.5)
+                        c='blue', s=0.5, alpha=0.6)
             ax1.set_title('Original')
             
             # 生成的点云
             ax2 = fig.add_subplot(122, projection='3d')
             ax2.scatter(gen_sample[:, 0], gen_sample[:, 1], gen_sample[:, 2],
-                       c=[0.1, 0.8, 0.1], s=1, alpha=0.5)
+                    c='red', s=0.5, alpha=0.6)
             ax2.set_title('Generated')
             
             plt.tight_layout()
