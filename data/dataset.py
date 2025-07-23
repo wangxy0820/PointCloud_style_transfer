@@ -5,12 +5,13 @@ import os
 import glob
 from typing import List, Tuple, Dict, Optional
 import random
+import warnings
 
 from .augmentation import PointCloudAugmentation
 
 
 class PointCloudStyleTransferDataset(Dataset):
-    """点云风格转换数据集"""
+    """点云风格转换数据集 - 支持不同chunk size"""
     
     def __init__(self, 
                  data_dir: str,
@@ -44,7 +45,11 @@ class PointCloudStyleTransferDataset(Dataset):
         if len(self.files) == 0:
             raise ValueError(f"No files found in {self.split_dir}")
         
+        # 检查数据的chunk_size是否匹配
+        self._check_chunk_size_compatibility()
+        
         print(f"Loaded {len(self.files)} files for {split} split")
+        print(f"Dataset chunk_size: {self.data_chunk_size}, requested chunk_size: {chunk_size}")
         
         # 数据增强
         if augment and split == 'train':
@@ -68,15 +73,44 @@ class PointCloudStyleTransferDataset(Dataset):
         
         return files
     
+    def _check_chunk_size_compatibility(self):
+        """检查数据的chunk_size是否与请求的匹配"""
+        if len(self.files) == 0:
+            return
+        
+        # 加载第一个文件检查
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            sample_data = torch.load(self.files[0], weights_only=False)
+        
+        # 获取数据的chunk_size
+        self.data_chunk_size = sample_data.get('chunk_size', 2048)
+        
+        # 检查第一个chunk的实际大小
+        if 'sim_chunks' in sample_data and len(sample_data['sim_chunks']) > 0:
+            actual_size = len(sample_data['sim_chunks'][0][0])
+            if actual_size != self.data_chunk_size:
+                self.data_chunk_size = actual_size
+        
+        # 如果不匹配，发出警告
+        if self.data_chunk_size != self.chunk_size:
+            print(f"WARNING: Data was preprocessed with chunk_size={self.data_chunk_size}, "
+                  f"but dataset is configured with chunk_size={self.chunk_size}")
+            print(f"The dataset will use the preprocessed chunk_size={self.data_chunk_size}")
+            # 使用数据中的chunk_size
+            self.chunk_size = self.data_chunk_size
+    
     def __len__(self) -> int:
         return len(self.files)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # 加载预处理的数据
-        try:
-            data = torch.load(self.files[idx])
-        except Exception as e:
-            raise RuntimeError(f"Failed to load {self.files[idx]}: {e}")
+        # 加载预处理的数据（禁用警告）
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            try:
+                data = torch.load(self.files[idx], weights_only=False)
+            except Exception as e:
+                raise RuntimeError(f"Failed to load {self.files[idx]}: {e}")
         
         # 获取块数据
         sim_chunks = data['sim_chunks']
@@ -105,23 +139,9 @@ class PointCloudStyleTransferDataset(Dataset):
         sim_points = torch.from_numpy(sim_chunk).float()
         real_points = torch.from_numpy(real_chunk).float()
         
-        # 确保点数正确
-        if len(sim_points) != self.chunk_size:
-            # 调整点数
-            if len(sim_points) > self.chunk_size:
-                indices = np.random.choice(len(sim_points), self.chunk_size, replace=False)
-                sim_points = sim_points[indices]
-            else:
-                indices = np.random.choice(len(sim_points), self.chunk_size, replace=True)
-                sim_points = sim_points[indices]
-        
-        if len(real_points) != self.chunk_size:
-            if len(real_points) > self.chunk_size:
-                indices = np.random.choice(len(real_points), self.chunk_size, replace=False)
-                real_points = real_points[indices]
-            else:
-                indices = np.random.choice(len(real_points), self.chunk_size, replace=True)
-                real_points = real_points[indices]
+        # 动态调整点数到目标chunk_size（如果需要）
+        sim_points = self._adjust_point_count(sim_points, self.chunk_size)
+        real_points = self._adjust_point_count(real_points, self.chunk_size)
         
         # 数据增强
         if self.augmentation is not None:
@@ -136,11 +156,28 @@ class PointCloudStyleTransferDataset(Dataset):
             'chunk_idx': chunk_idx,
             'num_chunks': num_chunks,
             'file_idx': idx,
+            'data_chunk_size': self.data_chunk_size,
             'norm_params': data.get('norm_params', {
                 'sim': data.get('sim_norm_params', {}),
                 'real': data.get('real_norm_params', {})
             })
         }
+    
+    def _adjust_point_count(self, points: torch.Tensor, target_size: int) -> torch.Tensor:
+        """调整点数到目标大小"""
+        current_size = len(points)
+        
+        if current_size == target_size:
+            return points
+        
+        if current_size > target_size:
+            # 随机采样
+            indices = np.random.choice(current_size, target_size, replace=False)
+            return points[indices]
+        else:
+            # 重复采样
+            indices = np.random.choice(current_size, target_size, replace=True)
+            return points[indices]
 
 
 def create_dataloaders(data_dir: str,
@@ -149,7 +186,9 @@ def create_dataloaders(data_dir: str,
                       chunk_size: int = 2048,
                       pin_memory: bool = True,
                       max_chunks_per_sample: int = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """创建数据加载器"""
+    """创建数据加载器 - 自动适应数据的chunk_size"""
+    
+    print(f"Creating dataloaders with requested chunk_size={chunk_size}")
     
     # 创建数据集
     train_dataset = PointCloudStyleTransferDataset(
@@ -175,6 +214,11 @@ def create_dataloaders(data_dir: str,
         augment=False,
         max_chunks_per_sample=max_chunks_per_sample
     )
+    
+    # 获取实际使用的chunk_size（可能与请求的不同）
+    actual_chunk_size = train_dataset.chunk_size
+    if actual_chunk_size != chunk_size:
+        print(f"Note: Using actual chunk_size={actual_chunk_size} from preprocessed data")
     
     # 创建数据加载器
     train_loader = DataLoader(
@@ -219,7 +263,13 @@ if __name__ == "__main__":
     else:
         data_dir = "datasets/processed"
     
+    if len(sys.argv) > 2:
+        chunk_size = int(sys.argv[2])
+    else:
+        chunk_size = 2048
+    
     print(f"Testing data loading from: {data_dir}")
+    print(f"Requested chunk_size: {chunk_size}")
     
     try:
         # 测试创建数据加载器
@@ -227,7 +277,7 @@ if __name__ == "__main__":
             data_dir=data_dir,
             batch_size=4,
             num_workers=0,
-            chunk_size=2048
+            chunk_size=chunk_size
         )
         
         print(f"Train batches: {len(train_loader)}")
@@ -242,6 +292,7 @@ if __name__ == "__main__":
             print(f"  real_points shape: {batch['real_points'].shape}")
             print(f"  chunk_idx: {batch['chunk_idx']}")
             print(f"  num_chunks: {batch['num_chunks']}")
+            print(f"  data_chunk_size: {batch['data_chunk_size'][0]}")
         
     except Exception as e:
         print(f"Error: {e}")

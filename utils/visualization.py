@@ -48,21 +48,21 @@ class PointCloudVisualizer:
         # 仿真点云
         ax1 = fig.add_subplot(131, projection='3d')
         ax1.scatter(sim_sample[:, 0], sim_sample[:, 1], sim_sample[:, 2],
-                   c=self.colors['sim'], s=1, alpha=0.5)
+           c='blue', s=0.5, alpha=0.6)
         ax1.set_title('Simulation')
         self._set_axes_equal(ax1)
         
         # 生成的点云
         ax2 = fig.add_subplot(132, projection='3d')
         ax2.scatter(gen_sample[:, 0], gen_sample[:, 1], gen_sample[:, 2],
-                   c=self.colors['generated'], s=1, alpha=0.5)
+           c='red', s=0.5, alpha=0.6)
         ax2.set_title('Generated (Real Style)')
         self._set_axes_equal(ax2)
         
         # 真实参考
         ax3 = fig.add_subplot(133, projection='3d')
         ax3.scatter(real_sample[:, 0], real_sample[:, 1], real_sample[:, 2],
-                   c=self.colors['real'], s=1, alpha=0.5)
+           c='green', s=0.5, alpha=0.6)
         ax3.set_title('Real Reference')
         self._set_axes_equal(ax3)
         

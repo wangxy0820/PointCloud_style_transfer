@@ -63,9 +63,9 @@ def main():
     
     # 其他选项
     parser.add_argument('--use_ema', action='store_true', help='Use exponential moving average')
-    parser.add_argument('--gradient_clip', type=float, default=1.0)
+    parser.add_argument('--gradient_clip', type=float, default=0.5)
     parser.add_argument('--save_interval', type=int, default=10)
-    parser.add_argument('--log_interval', type=int, default=50)
+    parser.add_argument('--log_interval', type=int, default=10)
     
     args = parser.parse_args()
     

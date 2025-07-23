@@ -18,12 +18,29 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.preprocessing import ImprovedPointCloudPreprocessor
 
 
+def verify_chunk_consistency(data_path):
+    """验证chunk大小的一致性"""
+    data = torch.load(data_path, weights_only=False)
+    
+    chunk_sizes = set()
+    if 'sim_chunks' in data:
+        for chunk, _ in data['sim_chunks']:
+            chunk_sizes.add(len(chunk))
+    if 'real_chunks' in data:
+        for chunk, _ in data['real_chunks']:
+            chunk_sizes.add(len(chunk))
+    
+    expected_size = data.get('chunk_size', 2048)
+    
+    return len(chunk_sizes) == 1 and expected_size in chunk_sizes, chunk_sizes
+
+
 def process_single_pair(args):
     """处理单对点云文件"""
     sim_file, real_file, output_dir, file_id, preprocessor_params = args
     
     try:
-        # 创建预处理器
+        # 创建预处理器（使用修复版）
         preprocessor = ImprovedPointCloudPreprocessor(**preprocessor_params)
         
         # 加载点云
@@ -43,10 +60,17 @@ def process_single_pair(args):
             else:
                 raise ValueError(f"Invalid shape for real_points: {real_points.shape}")
         
+        print(f"Processing {file_id}: sim={sim_points.shape}, real={real_points.shape}")
+        
         # 预处理并保存
         save_path = preprocessor.save_preprocessed_data(
             sim_points, real_points, output_dir, file_id
         )
+        
+        # 验证处理结果
+        is_consistent, sizes = verify_chunk_consistency(save_path)
+        if not is_consistent:
+            raise ValueError(f"Chunk sizes not consistent: {sizes}")
         
         return True, save_path
     
@@ -56,7 +80,7 @@ def process_single_pair(args):
 
 def create_split_folders(output_dir: str, file_paths: list, 
                         train_ratio: float, val_ratio: float):
-    """创建数据集划分并复制文件到相应文件夹"""
+    """创建数据集划分"""
     
     # 创建划分文件夹
     train_dir = os.path.join(output_dir, 'train')
@@ -68,6 +92,7 @@ def create_split_folders(output_dir: str, file_paths: list,
     os.makedirs(test_dir, exist_ok=True)
     
     # 随机打乱文件
+    np.random.seed(42)  # 固定种子以保证可重复性
     np.random.shuffle(file_paths)
     
     # 计算划分点
@@ -80,26 +105,42 @@ def create_split_folders(output_dir: str, file_paths: list,
     val_files = file_paths[n_train:n_train + n_val]
     test_files = file_paths[n_train + n_val:]
     
-    # 复制文件到相应目录
     print("\nCreating dataset splits...")
     
-    # 复制训练文件
-    for i, src_path in enumerate(tqdm(train_files, desc="Copying train files")):
+    # 复制并验证训练文件
+    train_issues = 0
+    for i, src_path in enumerate(tqdm(train_files, desc="Processing train files")):
         filename = f"train_{i:04d}.pt"
         dst_path = os.path.join(train_dir, filename)
         shutil.copy2(src_path, dst_path)
+        
+        # 验证
+        is_consistent, sizes = verify_chunk_consistency(dst_path)
+        if not is_consistent:
+            train_issues += 1
+            print(f"\nWarning: {filename} has inconsistent chunks: {sizes}")
     
     # 复制验证文件
-    for i, src_path in enumerate(tqdm(val_files, desc="Copying val files")):
+    val_issues = 0
+    for i, src_path in enumerate(tqdm(val_files, desc="Processing val files")):
         filename = f"val_{i:04d}.pt"
         dst_path = os.path.join(val_dir, filename)
         shutil.copy2(src_path, dst_path)
+        
+        is_consistent, sizes = verify_chunk_consistency(dst_path)
+        if not is_consistent:
+            val_issues += 1
     
     # 复制测试文件
-    for i, src_path in enumerate(tqdm(test_files, desc="Copying test files")):
+    test_issues = 0
+    for i, src_path in enumerate(tqdm(test_files, desc="Processing test files")):
         filename = f"test_{i:04d}.pt"
         dst_path = os.path.join(test_dir, filename)
         shutil.copy2(src_path, dst_path)
+        
+        is_consistent, sizes = verify_chunk_consistency(dst_path)
+        if not is_consistent:
+            test_issues += 1
     
     # 保存划分信息
     split_info = {
@@ -109,37 +150,42 @@ def create_split_folders(output_dir: str, file_paths: list,
         'train_count': len(train_files),
         'val_count': len(val_files),
         'test_count': len(test_files),
-        'total_count': n_total
+        'total_count': n_total,
+        'train_issues': train_issues,
+        'val_issues': val_issues,
+        'test_issues': test_issues
     }
     
     split_file = os.path.join(output_dir, 'dataset_split_info.pt')
     torch.save(split_info, split_file)
     
-    return len(train_files), len(val_files), len(test_files)
+    return len(train_files), len(val_files), len(test_files), train_issues + val_issues + test_issues
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Preprocess point cloud data')
+    parser = argparse.ArgumentParser(description='Reprocess point cloud data with fixed chunk sizes')
     parser.add_argument('--sim_dir', required=True, help='Simulation data directory')
     parser.add_argument('--real_dir', required=True, help='Real world data directory')
     parser.add_argument('--output_dir', required=True, help='Output directory')
     parser.add_argument('--chunk_size', type=int, default=2048, help='Points per chunk')
-    parser.add_argument('--overlap_ratio', type=float, default=0.3, help='Overlap ratio between chunks')
-    parser.add_argument('--total_points', type=int, default=120000, help='Total points in full point cloud')
-    parser.add_argument('--num_workers', type=int, default=8, help='Number of parallel workers')
-    parser.add_argument('--train_ratio', type=float, default=0.8, help='Training set ratio')
-    parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation set ratio')
-    parser.add_argument('--temp_dir', type=str, default=None, help='Temporary directory for intermediate files')
+    parser.add_argument('--overlap_ratio', type=float, default=0.3, help='Overlap ratio')
+    parser.add_argument('--total_points', type=int, default=120000, help='Total points')
+    parser.add_argument('--num_workers', type=int, default=8, help='Number of workers')
+    parser.add_argument('--train_ratio', type=float, default=0.8, help='Training ratio')
+    parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation ratio')
+    parser.add_argument('--backup_old', action='store_true', help='Backup old processed data')
     
     args = parser.parse_args()
     
-    # 设置临时目录
-    if args.temp_dir is None:
-        args.temp_dir = os.path.join(args.output_dir, 'temp')
+    # 备份旧数据
+    if args.backup_old and os.path.exists(args.output_dir):
+        backup_dir = f"{args.output_dir}_backup_{np.random.randint(10000)}"
+        print(f"Backing up old data to {backup_dir}")
+        shutil.move(args.output_dir, backup_dir)
     
-    # 创建输出目录
-    os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.temp_dir, exist_ok=True)
+    # 设置临时目录
+    temp_dir = os.path.join(args.output_dir, 'temp')
+    os.makedirs(temp_dir, exist_ok=True)
     
     # 获取文件列表
     sim_files = sorted(glob.glob(os.path.join(args.sim_dir, '*.npy')))
@@ -149,7 +195,7 @@ def main():
     print(f"Found {len(real_files)} real world files")
     
     if len(sim_files) == 0 or len(real_files) == 0:
-        print("Error: No .npy files found in the specified directories!")
+        print("Error: No .npy files found!")
         return
     
     # 确保数量匹配
@@ -157,7 +203,9 @@ def main():
     sim_files = sim_files[:num_pairs]
     real_files = real_files[:num_pairs]
     
-    print(f"Processing {num_pairs} point cloud pairs")
+    print(f"\nProcessing {num_pairs} point cloud pairs")
+    print(f"Chunk size: {args.chunk_size}")
+    print(f"Overlap ratio: {args.overlap_ratio}")
     
     # 准备处理参数
     preprocessor_params = {
@@ -169,10 +217,10 @@ def main():
     process_args = []
     for i, (sim_file, real_file) in enumerate(zip(sim_files, real_files)):
         file_id = f'pair_{i:04d}'
-        process_args.append((sim_file, real_file, args.temp_dir, file_id, preprocessor_params))
+        process_args.append((sim_file, real_file, temp_dir, file_id, preprocessor_params))
     
     # 并行处理
-    print(f"\nProcessing {num_pairs} point cloud pairs with {args.num_workers} workers...")
+    print(f"\nProcessing with {args.num_workers} workers...")
     
     success_count = 0
     processed_files = []
@@ -196,7 +244,7 @@ def main():
     
     # 创建数据集划分
     if success_count > 0:
-        n_train, n_val, n_test = create_split_folders(
+        n_train, n_val, n_test, n_issues = create_split_folders(
             args.output_dir, 
             processed_files,
             args.train_ratio,
@@ -204,18 +252,31 @@ def main():
         )
         
         print(f"\nDataset split created:")
-        print(f"  Train: {n_train} samples ({n_train/success_count*100:.1f}%)")
-        print(f"  Val: {n_val} samples ({n_val/success_count*100:.1f}%)")
-        print(f"  Test: {n_test} samples ({n_test/success_count*100:.1f}%)")
+        print(f"  Train: {n_train} samples")
+        print(f"  Val: {n_val} samples")
+        print(f"  Test: {n_test} samples")
+        
+        if n_issues > 0:
+            print(f"  ⚠️  Warning: {n_issues} files have chunk size issues!")
+        else:
+            print(f"  ✓ All files have consistent chunk sizes!")
         
         # 清理临时文件
-        print("\nCleaning up temporary files...")
-        shutil.rmtree(args.temp_dir)
+        print("\nCleaning up...")
+        shutil.rmtree(temp_dir)
         
-        print(f"\nPreprocessing completed! Data saved to:")
-        print(f"  {os.path.join(args.output_dir, 'train')}")
-        print(f"  {os.path.join(args.output_dir, 'val')}")
-        print(f"  {os.path.join(args.output_dir, 'test')}")
+        print(f"\n✓ Preprocessing completed!")
+        print(f"Data saved to: {args.output_dir}")
+        
+        # 最终验证
+        print("\nFinal verification:")
+        for split in ['train', 'val', 'test']:
+            split_dir = os.path.join(args.output_dir, split)
+            files = glob.glob(os.path.join(split_dir, '*.pt'))
+            if files:
+                data = torch.load(files[0], weights_only=False)
+                print(f"  {split}: chunk_size={data.get('chunk_size')}, "
+                      f"first chunk size={len(data['sim_chunks'][0][0])}")
     else:
         print("No files were successfully processed!")
 

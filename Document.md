@@ -128,14 +128,6 @@ python scripts/preprocess_data.py \
     --chunk_size 2048 \
     --overlap_ratio 0.3 \
     --num_workers 1
-
-python scripts/preprocess_data.py \
-    --sim_dir datasets/simulation \
-    --real_dir datasets/real_world \
-    --output_dir datasets/processed \
-    --chunk_size 2048 \
-    --overlap_ratio 0.3 \
-    --sequential
 ```
 
 参数说明：
@@ -151,6 +143,7 @@ python scripts/train.py \
     --experiment_name my_experiment \
     --batch_size 8 \
     --num_epochs 40
+    --use_ema \
 ```
 
 高级训练选项：
