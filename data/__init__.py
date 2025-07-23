@@ -1,11 +1,13 @@
-"""
-Data module for point cloud style transfer
-"""
-
-from .dataset import create_paired_data_loaders
-from .preprocess import preprocess_dataset
+from .dataset import (
+    PointCloudStyleTransferDataset,
+    create_dataloaders
+)
+from .preprocessing import ImprovedPointCloudPreprocessor
+from .augmentation import PointCloudAugmentation
 
 __all__ = [
-    'create_paired_data_loaders',
-    'preprocess_dataset'
+    "PointCloudStyleTransferDataset",
+    "create_dataloaders",
+    "ImprovedPointCloudPreprocessor",
+    "PointCloudAugmentation"
 ]

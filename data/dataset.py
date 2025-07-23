@@ -1,288 +1,179 @@
 import torch
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import os
-import pickle
-import random
-from torch.utils.data import Dataset, DataLoader
+import glob
 from typing import List, Tuple, Dict, Optional
-from .preprocess import PointCloudPreprocessor
+import random
+
+from .augmentation import PointCloudAugmentation
 
 
-class PointCloudDataset(Dataset):
-    """点云数据集类"""
+class PointCloudStyleTransferDataset(Dataset):
+    """点云风格转换数据集"""
     
-    def __init__(self, data_files: List[Tuple[str, str]], 
-                 augment: bool = False,
-                 augment_params: Optional[Dict] = None):
+    def __init__(self, 
+                 data_dir: str,
+                 split: str = 'train',
+                 chunk_size: int = 2048,
+                 augment: bool = True,
+                 max_chunks_per_sample: int = None):
         """
-        初始化数据集
         Args:
-            data_files: 文件路径和域标签的列表 [(path, domain), ...]
+            data_dir: 预处理数据的根目录
+            split: 'train', 'val', 或 'test'
+            chunk_size: 每个块的点数
             augment: 是否进行数据增强
-            augment_params: 数据增强参数
+            max_chunks_per_sample: 每个样本最多使用多少个块（用于渐进式训练）
         """
-        self.data_files = data_files
+        self.data_dir = data_dir
+        self.split = split
+        self.chunk_size = chunk_size
         self.augment = augment
-        self.augment_params = augment_params or {}
+        self.max_chunks_per_sample = max_chunks_per_sample
         
-        if self.augment:
-            self.preprocessor = PointCloudPreprocessor()
+        # 获取该split的目录
+        self.split_dir = os.path.join(data_dir, split)
         
-        # 分离不同域的数据
-        self.sim_files = [(path, domain) for path, domain in data_files if domain == "sim"]
-        self.real_files = [(path, domain) for path, domain in data_files if domain == "real"]
+        if not os.path.exists(self.split_dir):
+            raise ValueError(f"Split directory does not exist: {self.split_dir}")
         
-        print(f"Dataset initialized with {len(self.sim_files)} sim files and {len(self.real_files)} real files")
-    
-    def __len__(self) -> int:
-        return len(self.data_files)
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        获取数据样本
-        Args:
-            idx: 样本索引
-        Returns:
-            包含点云数据和域标签的字典
-        """
-        file_path, domain = self.data_files[idx]
+        # 加载文件列表
+        self.files = self._load_file_list()
         
-        # 加载点云数据
-        points = np.load(file_path).astype(np.float32)
+        if len(self.files) == 0:
+            raise ValueError(f"No files found in {self.split_dir}")
+        
+        print(f"Loaded {len(self.files)} files for {split} split")
         
         # 数据增强
-        if self.augment:
-            points = self.preprocessor.augment_point_cloud(
-                points,
-                rotation_range=self.augment_params.get("rotation_range", 0.1),
-                jitter_std=self.augment_params.get("jitter_std", 0.01),
-                scaling_range=self.augment_params.get("scaling_range", (0.9, 1.1))
+        if augment and split == 'train':
+            self.augmentation = PointCloudAugmentation(
+                rotation_range=0.1,
+                jitter_std=0.01,
+                scale_range=(0.95, 1.05)
             )
+        else:
+            self.augmentation = None
+    
+    def _load_file_list(self) -> List[str]:
+        """加载文件列表"""
+        pattern = os.path.join(self.split_dir, f'{self.split}_*.pt')
+        files = sorted(glob.glob(pattern))
+        
+        if len(files) == 0:
+            # 尝试另一种模式
+            pattern = os.path.join(self.split_dir, '*.pt')
+            files = sorted(glob.glob(pattern))
+        
+        return files
+    
+    def __len__(self) -> int:
+        return len(self.files)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # 加载预处理的数据
+        try:
+            data = torch.load(self.files[idx])
+        except Exception as e:
+            raise RuntimeError(f"Failed to load {self.files[idx]}: {e}")
+        
+        # 获取块数据
+        sim_chunks = data['sim_chunks']
+        real_chunks = data['real_chunks']
+        
+        # 限制块数（用于渐进式训练）
+        if self.max_chunks_per_sample is not None:
+            num_chunks = min(len(sim_chunks), len(real_chunks), self.max_chunks_per_sample)
+        else:
+            num_chunks = min(len(sim_chunks), len(real_chunks))
+        
+        # 随机选择一个块
+        chunk_idx = np.random.randint(0, num_chunks)
+        
+        # 获取块数据和位置
+        sim_chunk, sim_pos = sim_chunks[chunk_idx]
+        real_chunk, real_pos = real_chunks[chunk_idx]
+        
+        # 确保是numpy数组
+        if isinstance(sim_chunk, torch.Tensor):
+            sim_chunk = sim_chunk.numpy()
+        if isinstance(real_chunk, torch.Tensor):
+            real_chunk = real_chunk.numpy()
         
         # 转换为张量
-        points_tensor = torch.from_numpy(points).float()
+        sim_points = torch.from_numpy(sim_chunk).float()
+        real_points = torch.from_numpy(real_chunk).float()
         
-        # 域标签
-        domain_label = 0 if domain == "sim" else 1
+        # 确保点数正确
+        if len(sim_points) != self.chunk_size:
+            # 调整点数
+            if len(sim_points) > self.chunk_size:
+                indices = np.random.choice(len(sim_points), self.chunk_size, replace=False)
+                sim_points = sim_points[indices]
+            else:
+                indices = np.random.choice(len(sim_points), self.chunk_size, replace=True)
+                sim_points = sim_points[indices]
         
-        return {
-            "points": points_tensor,
-            "domain": torch.tensor(domain_label, dtype=torch.long),
-            "domain_name": domain,
-            "file_path": file_path
-        }
-    
-    def get_paired_sample(self) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        """
-        获取配对样本（一个sim样本和一个real样本）
-        Returns:
-            sim样本和real样本的元组
-        """
-        # 随机选择sim样本
-        sim_idx = random.randint(0, len(self.sim_files) - 1)
-        sim_file_path, sim_domain = self.sim_files[sim_idx]
-        
-        # 随机选择real样本
-        real_idx = random.randint(0, len(self.real_files) - 1)
-        real_file_path, real_domain = self.real_files[real_idx]
-        
-        # 加载数据
-        sim_points = np.load(sim_file_path).astype(np.float32)
-        real_points = np.load(real_file_path).astype(np.float32)
+        if len(real_points) != self.chunk_size:
+            if len(real_points) > self.chunk_size:
+                indices = np.random.choice(len(real_points), self.chunk_size, replace=False)
+                real_points = real_points[indices]
+            else:
+                indices = np.random.choice(len(real_points), self.chunk_size, replace=True)
+                real_points = real_points[indices]
         
         # 数据增强
-        if self.augment:
-            sim_points = self.preprocessor.augment_point_cloud(sim_points, **self.augment_params)
-            real_points = self.preprocessor.augment_point_cloud(real_points, **self.augment_params)
-        
-        sim_sample = {
-            "points": torch.from_numpy(sim_points).float(),
-            "domain": torch.tensor(0, dtype=torch.long),
-            "domain_name": "sim",
-            "file_path": sim_file_path
-        }
-        
-        real_sample = {
-            "points": torch.from_numpy(real_points).float(),
-            "domain": torch.tensor(1, dtype=torch.long),
-            "domain_name": "real",
-            "file_path": real_file_path
-        }
-        
-        return sim_sample, real_sample
-
-
-class PairedPointCloudDataset(Dataset):
-    """配对点云数据集，确保每个batch包含相同数量的sim和real样本"""
-    
-    def __init__(self, sim_files: List[str], real_files: List[str],
-                 augment: bool = False, augment_params: Optional[Dict] = None):
-        """
-        初始化配对数据集
-        Args:
-            sim_files: sim文件路径列表
-            real_files: real文件路径列表
-            augment: 是否进行数据增强
-            augment_params: 数据增强参数
-        """
-        self.sim_files = sim_files
-        self.real_files = real_files
-        self.augment = augment
-        self.augment_params = augment_params or {}
-        
-        if self.augment:
-            self.preprocessor = PointCloudPreprocessor()
-        
-        # 确保两个域的样本数量相同
-        self.length = min(len(sim_files), len(real_files))
-        
-    def __len__(self) -> int:
-        return self.length
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        获取配对样本
-        Args:
-            idx: 样本索引
-        Returns:
-            包含sim和real样本的字典
-        """
-        # 获取对应的文件
-        sim_file = self.sim_files[idx % len(self.sim_files)]
-        real_file = self.real_files[idx % len(self.real_files)]
-        
-        # 加载点云数据
-        sim_points = np.load(sim_file).astype(np.float32)
-        real_points = np.load(real_file).astype(np.float32)
-        
-        # 数据增强
-        if self.augment:
-            sim_points = self.preprocessor.augment_point_cloud(sim_points, **self.augment_params)
-            real_points = self.preprocessor.augment_point_cloud(real_points, **self.augment_params)
+        if self.augmentation is not None:
+            sim_points = self.augmentation(sim_points)
+            real_points = self.augmentation(real_points)
         
         return {
-            "sim_points": torch.from_numpy(sim_points).float(),
-            "real_points": torch.from_numpy(real_points).float(),
-            "sim_domain": torch.tensor(0, dtype=torch.long),
-            "real_domain": torch.tensor(1, dtype=torch.long),
-            "sim_file": sim_file,
-            "real_file": real_file
+            'sim_points': sim_points,
+            'real_points': real_points,
+            'sim_position': sim_pos,
+            'real_position': real_pos,
+            'chunk_idx': chunk_idx,
+            'num_chunks': num_chunks,
+            'file_idx': idx,
+            'norm_params': data.get('norm_params', {
+                'sim': data.get('sim_norm_params', {}),
+                'real': data.get('real_norm_params', {})
+            })
         }
 
 
-def create_data_loaders(data_dir: str, batch_size: int = 8, 
-                       num_workers: int = 4, pin_memory: bool = True,
-                       augment_train: bool = True, augment_params: Optional[Dict] = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    创建训练、验证和测试数据加载器
-    Args:
-        data_dir: 数据目录
-        batch_size: 批次大小
-        num_workers: 工作进程数
-        pin_memory: 是否固定内存
-        augment_train: 是否对训练数据进行增强
-        augment_params: 数据增强参数
-    Returns:
-        训练、验证、测试数据加载器
-    """
-    # 加载数据集划分
-    splits_file = os.path.join(data_dir, "dataset_splits.pkl")
-    with open(splits_file, "rb") as f:
-        splits = pickle.load(f)
+def create_dataloaders(data_dir: str,
+                      batch_size: int,
+                      num_workers: int = 4,
+                      chunk_size: int = 2048,
+                      pin_memory: bool = True,
+                      max_chunks_per_sample: int = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """创建数据加载器"""
     
     # 创建数据集
-    train_dataset = PointCloudDataset(
-        splits["train"], 
-        augment=augment_train,
-        augment_params=augment_params
+    train_dataset = PointCloudStyleTransferDataset(
+        data_dir, 
+        split='train', 
+        chunk_size=chunk_size, 
+        augment=True,
+        max_chunks_per_sample=max_chunks_per_sample
     )
     
-    val_dataset = PointCloudDataset(
-        splits["val"], 
-        augment=False
+    val_dataset = PointCloudStyleTransferDataset(
+        data_dir, 
+        split='val', 
+        chunk_size=chunk_size, 
+        augment=False,
+        max_chunks_per_sample=max_chunks_per_sample
     )
     
-    test_dataset = PointCloudDataset(
-        splits["test"], 
-        augment=False
-    )
-    
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        drop_last=False
-    )
-    
-    return train_loader, val_loader, test_loader
-
-
-def create_paired_data_loaders(data_dir: str, batch_size: int = 8,
-                              num_workers: int = 4, pin_memory: bool = True,
-                              augment_train: bool = True, augment_params: Optional[Dict] = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """
-    创建配对数据加载器
-    Args:
-        data_dir: 数据目录
-        batch_size: 批次大小
-        num_workers: 工作进程数
-        pin_memory: 是否固定内存
-        augment_train: 是否对训练数据进行增强
-        augment_params: 数据增强参数
-    Returns:
-        训练、验证、测试配对数据加载器
-    """
-    # 加载数据集划分
-    splits_file = os.path.join(data_dir, "dataset_splits.pkl")
-    with open(splits_file, "rb") as f:
-        splits = pickle.load(f)
-    
-    # 分离不同域的文件
-    def separate_domains(file_list):
-        sim_files = [path for path, domain in file_list if domain == "sim"]
-        real_files = [path for path, domain in file_list if domain == "real"]
-        return sim_files, real_files
-    
-    train_sim, train_real = separate_domains(splits["train"])
-    val_sim, val_real = separate_domains(splits["val"])
-    test_sim, test_real = separate_domains(splits["test"])
-    
-    # 创建配对数据集
-    train_dataset = PairedPointCloudDataset(
-        train_sim, train_real,
-        augment=augment_train,
-        augment_params=augment_params
-    )
-    
-    val_dataset = PairedPointCloudDataset(
-        val_sim, val_real,
-        augment=False
-    )
-    
-    test_dataset = PairedPointCloudDataset(
-        test_sim, test_real,
-        augment=False
+    test_dataset = PointCloudStyleTransferDataset(
+        data_dir, 
+        split='test', 
+        chunk_size=chunk_size, 
+        augment=False,
+        max_chunks_per_sample=max_chunks_per_sample
     )
     
     # 创建数据加载器
@@ -292,7 +183,8 @@ def create_paired_data_loaders(data_dir: str, batch_size: int = 8,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True
+        drop_last=True,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     val_loader = DataLoader(
@@ -301,7 +193,8 @@ def create_paired_data_loaders(data_dir: str, batch_size: int = 8,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False
+        drop_last=False,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     test_loader = DataLoader(
@@ -310,31 +203,47 @@ def create_paired_data_loaders(data_dir: str, batch_size: int = 8,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False
+        drop_last=False,
+        persistent_workers=True if num_workers > 0 else False
     )
     
     return train_loader, val_loader, test_loader
 
 
-def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
-    """
-    自定义batch整理函数
-    Args:
-        batch: 批次数据列表
-    Returns:
-        整理后的批次数据
-    """
-    # 获取批次中所有的键
-    keys = batch[0].keys()
+# 快速测试脚本，确保数据加载正常
+if __name__ == "__main__":
+    import sys
     
-    # 为每个键创建批次张量
-    batch_dict = {}
-    for key in keys:
-        if key in ["file_path", "sim_file", "real_file", "domain_name"]:
-            # 字符串列表不需要堆叠
-            batch_dict[key] = [item[key] for item in batch]
-        else:
-            # 数值张量需要堆叠
-            batch_dict[key] = torch.stack([item[key] for item in batch])
+    if len(sys.argv) > 1:
+        data_dir = sys.argv[1]
+    else:
+        data_dir = "datasets/processed"
     
-    return batch_dict
+    print(f"Testing data loading from: {data_dir}")
+    
+    try:
+        # 测试创建数据加载器
+        train_loader, val_loader, test_loader = create_dataloaders(
+            data_dir=data_dir,
+            batch_size=4,
+            num_workers=0,
+            chunk_size=2048
+        )
+        
+        print(f"Train batches: {len(train_loader)}")
+        print(f"Val batches: {len(val_loader)}")
+        print(f"Test batches: {len(test_loader)}")
+        
+        # 测试加载一个批次
+        if len(train_loader) > 0:
+            batch = next(iter(train_loader))
+            print(f"\nSample batch:")
+            print(f"  sim_points shape: {batch['sim_points'].shape}")
+            print(f"  real_points shape: {batch['real_points'].shape}")
+            print(f"  chunk_idx: {batch['chunk_idx']}")
+            print(f"  num_chunks: {batch['num_chunks']}")
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()

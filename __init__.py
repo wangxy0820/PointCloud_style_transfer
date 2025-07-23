@@ -1,18 +1,15 @@
-"""
-Point Cloud Style Transfer Project
-
-A comprehensive framework for point cloud style transfer using PointNet++ and GAN.
-Supports large-scale point clouds (120k points) with chunking strategies and 
-cycle-consistent domain adaptation from simulation to real world.
-"""
-
 __version__ = "1.0.0"
-__author__ = "Point Cloud Style Transfer Team"
-__email__ = "contact@example.com"
+__author__ = "Your Name"
+__email__ = "your.email@example.com"
 
-# 简化导入，只导入最常用的组件
-from config import Config
+# 主要模块导入
+from .config.config import Config
+from .models.diffusion_model import PointCloudDiffusionModel, DiffusionProcess
+from .training.trainer import DiffusionTrainer
 
 __all__ = [
-    'Config'
+    "Config",
+    "PointCloudDiffusionModel", 
+    "DiffusionProcess",
+    "DiffusionTrainer"
 ]

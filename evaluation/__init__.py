@@ -1,9 +1,7 @@
-"""
-Evaluation module for point cloud style transfer
-"""
-
 from .metrics import PointCloudMetrics
+from .tester import DiffusionTester
 
 __all__ = [
-    'PointCloudMetrics'
+    "PointCloudMetrics",
+    "DiffusionTester"
 ]

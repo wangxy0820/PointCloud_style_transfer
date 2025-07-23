@@ -1,16 +1,25 @@
-"""
-Models module for point cloud style transfer
-"""
-
-# 主要的模型类
-from .pointnet2 import PointNet2AutoEncoder
-from .generator import CycleConsistentGenerator  
-from .discriminator import HybridDiscriminator
-from .losses import StyleTransferLoss
+from .diffusion_model import (
+    PointCloudDiffusionModel, 
+    DiffusionProcess,
+    TimeEmbedding,
+    ResidualBlock,
+    CrossAttention
+)
+from .pointnet2_encoder import (
+    ImprovedPointNet2Encoder,
+    SetAbstraction
+)
+from .chunk_fusion import ImprovedChunkFusion
+from .losses import DiffusionLoss  # 只导入类，不导入函数
 
 __all__ = [
-    'PointNet2AutoEncoder',
-    'CycleConsistentGenerator', 
-    'HybridDiscriminator',
-    'StyleTransferLoss'
+    "PointCloudDiffusionModel",
+    "DiffusionProcess",
+    "TimeEmbedding",
+    "ResidualBlock",
+    "CrossAttention",
+    "ImprovedPointNet2Encoder",
+    "SetAbstraction",
+    "ImprovedChunkFusion",
+    "DiffusionLoss"
 ]

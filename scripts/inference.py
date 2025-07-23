@@ -1,422 +1,368 @@
 #!/usr/bin/env python3
 """
-点云风格迁移推理脚本
-用于对新的点云数据进行风格迁移
+推理脚本
 """
 
-import argparse
-import os
-import sys
 import torch
 import numpy as np
-import glob
+import os
+import argparse
 from tqdm import tqdm
-from datetime import datetime
+import glob
+import sys
+import time
 
-# 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config import Config
-from models.generator import CycleConsistentGenerator
-from data.preprocess import PointCloudPreprocessor
-from visualization.visualize import PointCloudVisualizer
-import logging
+from models.diffusion_model import PointCloudDiffusionModel, DiffusionProcess
+from models.pointnet2_encoder import ImprovedPointNet2Encoder
+from models.chunk_fusion import ImprovedChunkFusion
+from data.preprocessing import ImprovedPointCloudPreprocessor
+from utils.visualization import PointCloudVisualizer
+from utils.logger import Logger
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='Point Cloud Style Transfer Inference')
+class DiffusionInference:
+    """Diffusion模型推理"""
     
-    # 必需参数
-    parser.add_argument('--model_path', type=str, required=True,
-                       help='Path to trained model checkpoint')
-    parser.add_argument('--input_dir', type=str, required=True,
-                       help='Directory containing input point clouds (.npy files)')
-    parser.add_argument('--output_dir', type=str, required=True,
-                       help='Directory to save generated point clouds')
-    
-    # 风格参考
-    parser.add_argument('--style_reference', type=str, default='',
-                       help='Path to style reference point cloud (.npy file)')
-    parser.add_argument('--style_dir', type=str, default='',
-                       help='Directory containing style reference point clouds')
-    
-    # 模型参数
-    parser.add_argument('--chunk_size', type=int, default=8192,
-                       help='Point cloud chunk size')
-    parser.add_argument('--latent_dim', type=int, default=512,
-                       help='Latent dimension size')
-    parser.add_argument('--generator_dim', type=int, default=256,
-                       help='Generator style dimension')
-    
-    # 推理参数
-    parser.add_argument('--direction', type=str, default='sim2real',
-                       choices=['sim2real', 'real2sim'],
-                       help='Transfer direction')
-    parser.add_argument('--batch_size', type=int, default=1,
-                       help='Batch size for inference')
-    parser.add_argument('--device', type=str, default='cuda',
-                       choices=['cuda', 'cpu'],
-                       help='Device to use for inference')
-    parser.add_argument('--gpu_id', type=int, default=0,
-                       help='GPU ID to use')
-    
-    # 预处理参数
-    parser.add_argument('--preprocess', action='store_true',
-                       help='Preprocess input point clouds (chunking)')
-    parser.add_argument('--chunk_method', type=str, default='spatial',
-                       choices=['spatial', 'random', 'sliding'],
-                       help='Chunking method for preprocessing')
-    parser.add_argument('--merge_chunks', action='store_true',
-                       help='Merge chunks back to full point cloud')
-    
-    # 输出选项
-    parser.add_argument('--save_intermediate', action='store_true',
-                       help='Save intermediate chunk results')
-    parser.add_argument('--create_visualization', action='store_true',
-                       help='Create visualization images')
-    parser.add_argument('--save_comparison', action='store_true',
-                       help='Save before/after comparison images')
-    
-    # 其他选项
-    parser.add_argument('--random_style', action='store_true',
-                       help='Use random style for each input')
-    parser.add_argument('--output_format', type=str, default='npy',
-                       choices=['npy', 'ply', 'both'],
-                       help='Output file format')
-    
-    return parser.parse_args()
-
-
-def load_model(model_path: str, config: Config, device: torch.device):
-    """加载训练好的模型"""
-    # 创建模型
-    generator = CycleConsistentGenerator(
-        input_channels=config.input_dim,
-        feature_channels=config.pointnet_channels,
-        style_dim=config.generator_dim,
-        latent_dim=config.latent_dim,
-        num_points=config.chunk_size
-    ).to(device)
-    
-    # 加载检查点
-    checkpoint = torch.load(model_path, map_location=device)
-    generator.load_state_dict(checkpoint['generator_state_dict'])
-    generator.eval()
-    
-    return generator
-
-
-def load_point_cloud(file_path: str) -> np.ndarray:
-    """加载点云文件"""
-    if file_path.endswith('.npy'):
-        points = np.load(file_path)
-    elif file_path.endswith('.ply'):
-        # 这里可以添加PLY文件加载代码
-        raise NotImplementedError("PLY format not implemented yet")
-    else:
-        raise ValueError(f"Unsupported file format: {file_path}")
-    
-    # 确保是3D点云
-    if points.shape[1] > 3:
-        points = points[:, :3]
-    
-    return points.astype(np.float32)
-
-
-def save_point_cloud(points: np.ndarray, file_path: str, format: str = 'npy'):
-    """保存点云文件"""
-    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-    
-    if format == 'npy':
-        np.save(file_path, points)
-    elif format == 'ply':
-        # 这里可以添加PLY文件保存代码
-        raise NotImplementedError("PLY format not implemented yet")
-    elif format == 'both':
-        # 保存两种格式
-        base_path = os.path.splitext(file_path)[0]
-        np.save(base_path + '.npy', points)
-        # save_ply(points, base_path + '.ply')
-
-
-def preprocess_point_cloud(points: np.ndarray, chunk_size: int, 
-                         chunk_method: str = 'spatial') -> list:
-    """预处理点云（分块）"""
-    preprocessor = PointCloudPreprocessor(chunk_size=chunk_size)
-    
-    # 标准化
-    points = preprocessor.normalize_point_cloud(points)
-    
-    # 分块
-    if chunk_method == 'spatial':
-        num_chunks = max(1, len(points) // chunk_size)
-        chunks = preprocessor.spatial_chunk(points, num_chunks)
-    elif chunk_method == 'sliding':
-        chunks = preprocessor.sliding_window_chunk(points)
-    else:  # random
-        num_chunks = max(1, len(points) // chunk_size)
-        chunks = []
-        for i in range(num_chunks):
-            chunk = preprocessor.random_chunk(points, chunk_size)
-            chunks.append(preprocessor.normalize_point_cloud(chunk))
-    
-    return chunks
-
-
-def merge_chunks(chunks: list, original_size: int) -> np.ndarray:
-    """合并分块回完整点云"""
-    # 简单的合并策略：连接所有块并随机采样到原始大小
-    all_points = np.concatenate(chunks, axis=0)
-    
-    if len(all_points) > original_size:
-        # 随机采样
-        indices = np.random.choice(len(all_points), original_size, replace=False)
-        return all_points[indices]
-    else:
-        # 如果点数不足，进行上采样
-        indices = np.random.choice(len(all_points), original_size, replace=True)
-        return all_points[indices]
-
-
-def inference_single_file(generator: torch.nn.Module, 
-                         input_path: str,
-                         style_reference: torch.Tensor,
-                         device: torch.device,
-                         args) -> np.ndarray:
-    """对单个文件进行推理"""
-    # 加载输入点云
-    input_points = load_point_cloud(input_path)
-    original_size = len(input_points)
-    
-    # 预处理（如果需要）
-    if args.preprocess:
-        chunks = preprocess_point_cloud(input_points, args.chunk_size, args.chunk_method)
-        generated_chunks = []
+    def __init__(self, checkpoint_path: str, device: str = 'cuda'):
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        with torch.no_grad():
-            for chunk in chunks:
-                # 转换为张量
-                chunk_tensor = torch.from_numpy(chunk).unsqueeze(0).to(device)
-                style_tensor = style_reference.unsqueeze(0)
-                
-                # 风格迁移
-                if args.direction == 'sim2real':
-                    generated_chunk = generator.sim2real(chunk_tensor, style_tensor)
-                else:
-                    generated_chunk = generator.real2sim(chunk_tensor, style_tensor)
-                
-                generated_chunks.append(generated_chunk.squeeze(0).cpu().numpy())
+        # 初始化日志
+        self.logger = Logger(
+            name='DiffusionInference',
+            log_dir='logs/inference',
+            file_output=True
+        )
         
-        # 合并分块
-        if args.merge_chunks:
-            generated_points = merge_chunks(generated_chunks, original_size)
+        # 加载配置和模型
+        self.load_model(checkpoint_path)
+        
+        # 块融合模块
+        self.chunk_fusion = ImprovedChunkFusion(overlap_ratio=self.config.overlap_ratio).to(self.device)
+        
+        # 预处理器
+        self.preprocessor = ImprovedPointCloudPreprocessor(
+            total_points=self.config.total_points,
+            chunk_size=self.config.chunk_size,
+            overlap_ratio=self.config.overlap_ratio
+        )
+        
+        # 可视化器
+        self.visualizer = PointCloudVisualizer()
+        
+        self.logger.info("Inference engine initialized successfully")
+    
+    def load_model(self, checkpoint_path: str):
+        """加载模型"""
+        self.logger.info(f"Loading model from {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.config = checkpoint['config']
+        
+        # 初始化模型
+        self.model = PointCloudDiffusionModel(
+            input_dim=3,
+            hidden_dims=[128, 256, 512, 1024],
+            time_dim=self.config.time_embed_dim
+        ).to(self.device)
+        
+        self.style_encoder = ImprovedPointNet2Encoder(
+            input_channels=3,
+            feature_dim=1024
+        ).to(self.device)
+        
+        # 加载权重
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.style_encoder.load_state_dict(checkpoint['style_encoder_state_dict'])
+        
+        # 如果有EMA权重，使用EMA权重
+        if 'ema_state_dict' in checkpoint and checkpoint['ema_state_dict'] is not None:
+            self.logger.info("Using EMA weights")
+            ema_params = checkpoint['ema_state_dict']['shadow_params']
+            model_params = list(self.model.parameters())
+            for param, ema_param in zip(model_params, ema_params):
+                param.data.copy_(ema_param.data)
+        
+        self.model.eval()
+        self.style_encoder.eval()
+        
+        # Diffusion过程
+        self.diffusion_process = DiffusionProcess(
+            num_timesteps=self.config.num_timesteps,
+            beta_schedule=self.config.beta_schedule,
+            device=self.device
+        )
+        
+        self.logger.info(f"Model loaded successfully from epoch {checkpoint.get('epoch', 'unknown')}")
+    
+    @torch.no_grad()
+    def transfer_style(self, sim_points: np.ndarray, real_reference: np.ndarray,
+                      use_ddim: bool = True, ddim_steps: int = 50) -> np.ndarray:
+        """
+        转换完整点云的风格
+        Args:
+            sim_points: 仿真点云 [120000, 3]
+            real_reference: 真实参考点云 [N, 3]
+            use_ddim: 是否使用DDIM加速采样
+            ddim_steps: DDIM采样步数
+        Returns:
+            转换后的点云 [120000, 3]
+        """
+        start_time = time.time()
+        
+        # 1. 预处理和分块
+        self.logger.info("Preprocessing and chunking point cloud...")
+        sim_norm, sim_params = self.preprocessor.normalize_point_cloud(sim_points)
+        sim_chunks = self.preprocessor.create_overlapping_chunks(sim_norm)
+        
+        self.logger.info(f"Created {len(sim_chunks)} chunks from {len(sim_points)} points")
+        
+        # 2. 提取风格特征
+        self.logger.info("Extracting style features...")
+        real_norm, _ = self.preprocessor.normalize_point_cloud(real_reference)
+        
+        # 如果参考点云太大，随机采样
+        if len(real_norm) > self.config.chunk_size:
+            indices = np.random.choice(len(real_norm), self.config.chunk_size, replace=False)
+            real_sample = real_norm[indices]
         else:
-            generated_points = np.concatenate(generated_chunks, axis=0)
-    
-    else:
-        # 直接处理整个点云（需要确保大小合适）
-        if len(input_points) != args.chunk_size:
-            preprocessor = PointCloudPreprocessor(chunk_size=args.chunk_size)
-            if len(input_points) > args.chunk_size:
-                input_points = preprocessor.random_chunk(input_points, args.chunk_size)
+            real_sample = real_norm
+        
+        real_tensor = torch.from_numpy(real_sample).float().unsqueeze(0).to(self.device)
+        style_features = self.style_encoder(real_tensor).unsqueeze(1)  # [1, 1, feature_dim]
+        
+        # 3. 对每个块进行风格转换
+        self.logger.info("Transferring style for each chunk...")
+        transferred_chunks = []
+        chunk_positions = []
+        
+        for i, (chunk_points, position) in enumerate(tqdm(sim_chunks, desc="Processing chunks")):
+            chunk_tensor = torch.from_numpy(chunk_points).float().unsqueeze(0).to(self.device)
+            
+            # Diffusion采样
+            shape = chunk_tensor.shape
+            
+            if use_ddim and ddim_steps < self.config.num_timesteps:
+                # DDIM快速采样
+                transferred_chunk = self.ddim_sample(
+                    shape, style_features, ddim_steps
+                )
             else:
-                # 上采样
-                indices = np.random.choice(len(input_points), args.chunk_size, replace=True)
-                input_points = input_points[indices]
-        
-        # 标准化
-        preprocessor = PointCloudPreprocessor()
-        input_points = preprocessor.normalize_point_cloud(input_points)
-        
-        with torch.no_grad():
-            input_tensor = torch.from_numpy(input_points).unsqueeze(0).to(device)
-            style_tensor = style_reference.unsqueeze(0)
+                # 完整DDPM采样
+                transferred_chunk = self.diffusion_process.sample(
+                    self.model, shape, style_features
+                )
             
-            if args.direction == 'sim2real':
-                generated = generator.sim2real(input_tensor, style_tensor)
+            transferred_chunks.append(transferred_chunk.squeeze(0))
+            chunk_positions.append(position)
+            
+            # 定期清理GPU内存
+            if i % 10 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        # 4. 融合所有块
+        self.logger.info("Merging chunks into complete point cloud...")
+        fused_points = self.chunk_fusion.merge_all_chunks(transferred_chunks, chunk_positions)
+        
+        # 5. 还原标准化
+        final_points = self.preprocessor.denormalize_point_cloud(
+            fused_points.cpu().numpy(),
+            sim_params
+        )
+        
+        # 确保输出点数正确
+        if len(final_points) != len(sim_points):
+            self.logger.warning(f"Point count mismatch: {len(final_points)} vs {len(sim_points)}")
+            if len(final_points) > len(sim_points):
+                final_points = final_points[:len(sim_points)]
             else:
-                generated = generator.real2sim(input_tensor, style_tensor)
-            
-            generated_points = generated.squeeze(0).cpu().numpy()
-    
-    return generated_points
-
-
-def load_style_references(args, device: torch.device) -> list:
-    """加载风格参考点云"""
-    style_references = []
-    
-    if args.style_reference:
-        # 单个风格参考文件
-        style_points = load_point_cloud(args.style_reference)
-        preprocessor = PointCloudPreprocessor()
-        style_points = preprocessor.normalize_point_cloud(style_points)
+                # 填充缺失的点
+                repeat_indices = np.random.choice(len(final_points), len(sim_points) - len(final_points))
+                final_points = np.vstack([final_points, final_points[repeat_indices]])
         
-        # 调整大小
-        if len(style_points) != args.chunk_size:
-            if len(style_points) > args.chunk_size:
-                style_points = preprocessor.random_chunk(style_points, args.chunk_size)
-            else:
-                indices = np.random.choice(len(style_points), args.chunk_size, replace=True)
-                style_points = style_points[indices]
+        elapsed_time = time.time() - start_time
+        self.logger.info(f"Style transfer completed in {elapsed_time:.2f} seconds")
         
-        style_tensor = torch.from_numpy(style_points).to(device)
-        style_references.append(style_tensor)
+        return final_points
     
-    elif args.style_dir:
-        # 多个风格参考文件
-        style_files = glob.glob(os.path.join(args.style_dir, "*.npy"))
+    def ddim_sample(self, shape, style_features, num_steps: int = 50) -> torch.Tensor:
+        """DDIM快速采样"""
+        device = self.device
         
-        for style_file in style_files[:10]:  # 最多加载10个风格参考
-            style_points = load_point_cloud(style_file)
-            preprocessor = PointCloudPreprocessor()
-            style_points = preprocessor.normalize_point_cloud(style_points)
+        # 从纯噪声开始
+        x = torch.randn(shape, device=device)
+        
+        # 选择时间步的子集
+        timesteps = torch.linspace(
+            self.config.num_timesteps - 1, 0, 
+            num_steps, dtype=torch.long, device=device
+        )
+        
+        for i in tqdm(range(len(timesteps) - 1), desc="DDIM sampling", leave=False):
+            t = timesteps[i]
+            t_prev = timesteps[i + 1]
             
-            # 调整大小
-            if len(style_points) != args.chunk_size:
-                if len(style_points) > args.chunk_size:
-                    style_points = preprocessor.random_chunk(style_points, args.chunk_size)
-                else:
-                    indices = np.random.choice(len(style_points), args.chunk_size, replace=True)
-                    style_points = style_points[indices]
+            # 预测噪声
+            batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
+            predicted_noise = self.model(x, batch_t, style_features)
             
-            style_tensor = torch.from_numpy(style_points).to(device)
-            style_references.append(style_tensor)
+            # DDIM更新步骤
+            alpha_t = self.diffusion_process.alphas_cumprod[t]
+            alpha_t_prev = self.diffusion_process.alphas_cumprod[t_prev]
+            
+            # 预测x0
+            x0_pred = (x - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
+            
+            # 确定性更新（DDIM）
+            x = torch.sqrt(alpha_t_prev) * x0_pred + \
+                torch.sqrt(1 - alpha_t_prev) * predicted_noise
+        
+        return x
     
-    else:
-        # 使用随机风格（创建一个随机点云作为风格参考）
-        random_points = np.random.randn(args.chunk_size, 3).astype(np.float32)
-        style_tensor = torch.from_numpy(random_points).to(device)
-        style_references.append(style_tensor)
+    def process_file(self, sim_path: str, real_reference_path: str, 
+                    output_path: str, visualize: bool = False):
+        """处理单个文件"""
+        self.logger.info(f"Processing: {sim_path}")
+        
+        # 加载点云
+        sim_points = np.load(sim_path).astype(np.float32)
+        real_reference = np.load(real_reference_path).astype(np.float32)
+        
+        # 确保形状正确
+        if sim_points.shape[1] != 3:
+            sim_points = sim_points.T
+        if real_reference.shape[1] != 3:
+            real_reference = real_reference.T
+        
+        # 风格转换
+        transferred = self.transfer_style(sim_points, real_reference)
+        
+        # 保存结果
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        np.save(output_path, transferred.astype(np.float32))
+        self.logger.info(f"Saved result to: {output_path}")
+        
+        # 可视化
+        if visualize:
+            vis_path = output_path.replace('.npy', '_visualization.png')
+            self.visualizer.plot_style_transfer_result(
+                sim_points,
+                transferred,
+                real_reference,
+                title='Point Cloud Style Transfer Result',
+                save_path=vis_path,
+                sample_size=5000
+            )
+            self.logger.info(f"Visualization saved to: {vis_path}")
+        
+        return transferred
     
-    return style_references
+    def process_folder(self, sim_folder: str, real_reference_path: str, 
+                      output_folder: str, pattern: str = '*.npy',
+                      visualize: bool = False):
+        """批量处理文件夹"""
+        os.makedirs(output_folder, exist_ok=True)
+        
+        # 加载真实参考
+        real_reference = np.load(real_reference_path).astype(np.float32)
+        if real_reference.shape[1] != 3:
+            real_reference = real_reference.T
+        
+        # 查找所有匹配的文件
+        sim_files = sorted(glob.glob(os.path.join(sim_folder, pattern)))
+        
+        if not sim_files:
+            self.logger.warning(f"No files found matching pattern '{pattern}' in {sim_folder}")
+            return
+        
+        self.logger.info(f"Found {len(sim_files)} files to process")
+        
+        # 处理每个文件
+        for sim_file in tqdm(sim_files, desc="Processing files"):
+            # 构建输出路径
+            filename = os.path.basename(sim_file)
+            output_path = os.path.join(output_folder, filename.replace('.npy', '_transferred.npy'))
+            
+            try:
+                # 加载仿真点云
+                sim_points = np.load(sim_file).astype(np.float32)
+                if sim_points.shape[1] != 3:
+                    sim_points = sim_points.T
+                
+                # 风格转换
+                transferred = self.transfer_style(sim_points, real_reference)
+                
+                # 保存结果
+                np.save(output_path, transferred.astype(np.float32))
+                
+                # 可视化第一个文件
+                if visualize and sim_file == sim_files[0]:
+                    vis_path = output_path.replace('.npy', '_visualization.png')
+                    self.visualizer.plot_style_transfer_result(
+                        sim_points,
+                        transferred,
+                        real_reference,
+                        title=f'Style Transfer - {filename}',
+                        save_path=vis_path,
+                        sample_size=5000
+                    )
+                
+            except Exception as e:
+                self.logger.error(f"Failed to process {sim_file}: {e}")
+                continue
+        
+        self.logger.info(f"Batch processing completed. Results saved to: {output_folder}")
 
 
 def main():
-    """主函数"""
-    args = parse_args()
+    parser = argparse.ArgumentParser(description='Point Cloud Style Transfer Inference')
     
-    # 设置设备
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    if args.device == 'cuda' and torch.cuda.is_available():
-        torch.cuda.set_device(args.gpu_id)
-        print(f"Using GPU {args.gpu_id}: {torch.cuda.get_device_name()}")
+    # 必需参数
+    parser.add_argument('--checkpoint', type=str, required=True, help='Model checkpoint path')
+    parser.add_argument('--sim_input', type=str, required=True, 
+                       help='Simulation point cloud file or folder')
+    parser.add_argument('--real_reference', type=str, required=True, 
+                       help='Real reference point cloud')
+    parser.add_argument('--output', type=str, required=True, 
+                       help='Output file or folder')
+    
+    # 可选参数
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use')
+    parser.add_argument('--visualize', action='store_true', help='Generate visualizations')
+    parser.add_argument('--batch_process', action='store_true', 
+                       help='Process entire folder')
+    parser.add_argument('--pattern', type=str, default='*.npy', 
+                       help='File pattern for batch processing')
+    parser.add_argument('--use_ddim', action='store_true', 
+                       help='Use DDIM for faster sampling')
+    parser.add_argument('--ddim_steps', type=int, default=50, 
+                       help='Number of DDIM steps')
+    
+    args = parser.parse_args()
+    
+    # 创建推理器
+    inference = DiffusionInference(args.checkpoint, args.device)
+    
+    # 处理输入
+    if args.batch_process or os.path.isdir(args.sim_input):
+        # 批量处理
+        inference.process_folder(
+            args.sim_input, 
+            args.real_reference, 
+            args.output,
+            args.pattern,
+            args.visualize
+        )
     else:
-        print("Using CPU")
-    
-    # 创建输出目录
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # 设置日志
-    log_file = os.path.join(args.output_dir, 'inference.log')
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file),
-            logging.StreamHandler()
-        ]
-    )
-    logger = logging.getLogger(__name__)
-    
-    logger.info(f"Starting inference with model: {args.model_path}")
-    logger.info(f"Input directory: {args.input_dir}")
-    logger.info(f"Output directory: {args.output_dir}")
-    logger.info(f"Transfer direction: {args.direction}")
-    
-    # 创建配置
-    config = Config()
-    config.chunk_size = args.chunk_size
-    config.latent_dim = args.latent_dim
-    config.generator_dim = args.generator_dim
-    
-    # 加载模型
-    print("Loading model...")
-    try:
-        generator = load_model(args.model_path, config, device)
-        logger.info("Model loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        return
-    
-    # 加载风格参考
-    print("Loading style references...")
-    try:
-        style_references = load_style_references(args, device)
-        logger.info(f"Loaded {len(style_references)} style references")
-    except Exception as e:
-        logger.error(f"Failed to load style references: {e}")
-        return
-    
-    # 获取输入文件列表
-    input_files = glob.glob(os.path.join(args.input_dir, "*.npy"))
-    if not input_files:
-        logger.error(f"No .npy files found in {args.input_dir}")
-        return
-    
-    logger.info(f"Found {len(input_files)} input files")
-    
-    # 创建可视化器（如果需要）
-    if args.create_visualization:
-        visualizer = PointCloudVisualizer()
-        vis_dir = os.path.join(args.output_dir, 'visualizations')
-        os.makedirs(vis_dir, exist_ok=True)
-    
-    # 处理每个输入文件
-    print("Processing input files...")
-    for i, input_file in enumerate(tqdm(input_files, desc="Processing files")):
-        try:
-            # 选择风格参考
-            if args.random_style:
-                style_ref = style_references[np.random.randint(len(style_references))]
-            else:
-                style_ref = style_references[i % len(style_references)]
-            
-            # 进行推理
-            generated_points = inference_single_file(
-                generator, input_file, style_ref, device, args
-            )
-            
-            # 保存结果
-            base_name = os.path.splitext(os.path.basename(input_file))[0]
-            output_file = os.path.join(args.output_dir, f"{base_name}_generated.npy")
-            
-            save_point_cloud(generated_points, output_file, args.output_format)
-            
-            # 创建可视化（如果需要）
-            if args.create_visualization:
-                # 原始点云可视化
-                original_points = load_point_cloud(input_file)
-                
-                vis_file = os.path.join(vis_dir, f"{base_name}_generated.png")
-                visualizer.save_point_cloud(
-                    generated_points, vis_file,
-                    title=f"Generated - {base_name}",
-                    color='generated'
-                )
-                
-                # 对比可视化（如果需要）
-                if args.save_comparison:
-                    comparison_file = os.path.join(vis_dir, f"{base_name}_comparison.png")
-                    style_points = style_ref.cpu().numpy()
-                    
-                    visualizer.plot_style_transfer_result(
-                        original_points[:args.chunk_size] if len(original_points) > args.chunk_size else original_points,
-                        generated_points,
-                        style_points,
-                        title=f"Style Transfer - {base_name}",
-                        save_path=comparison_file
-                    )
-            
-            logger.info(f"Processed: {base_name}")
-            
-        except Exception as e:
-            logger.error(f"Failed to process {input_file}: {e}")
-            continue
-    
-    logger.info(f"Inference completed. Results saved to: {args.output_dir}")
-    print(f"\nInference completed! Generated files saved to: {args.output_dir}")
+        # 单个文件
+        inference.process_file(
+            args.sim_input,
+            args.real_reference,
+            args.output,
+            args.visualize
+        )
 
 
 if __name__ == "__main__":
