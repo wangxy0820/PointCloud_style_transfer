@@ -15,7 +15,7 @@ class Config:
     
     # 点云参数 - 修改以支持更大的chunk
     total_points: int = 120000    # 完整点云点数
-    chunk_size: int = 2048        # 增大到4096（可选：2048, 4096, 8192, 16384）
+    chunk_size: int = 4096        # 增大到4096（可选：2048, 4096, 8192, 16384）
     overlap_ratio: float = 0.2    # 减小重叠率以适应更大的chunk
     num_chunks_per_pc: int = 40   # 减少块数因为每块更大了
     

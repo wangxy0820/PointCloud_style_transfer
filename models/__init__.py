@@ -1,25 +1,22 @@
-from .diffusion_model import (
-    PointCloudDiffusionModel, 
-    DiffusionProcess,
-    TimeEmbedding,
-    ResidualBlock,
-    CrossAttention
+# models/__init__.py
+
+from .diffusion_model import PointCloudDiffusionModel, DiffusionProcess
+from .unsupervised_diffusion_model import (
+    UnsupervisedPointCloudDiffusionModel, 
+    UnsupervisedDiffusionProcess,
+    StyleEncoder,
+    ContentEncoder
 )
-from .pointnet2_encoder import (
-    ImprovedPointNet2Encoder,
-    SetAbstraction
-)
+from .pointnet2_encoder import ImprovedPointNet2Encoder
 from .chunk_fusion import ImprovedChunkFusion
-from .losses import DiffusionLoss  # 只导入类，不导入函数
 
 __all__ = [
-    "PointCloudDiffusionModel",
-    "DiffusionProcess",
-    "TimeEmbedding",
-    "ResidualBlock",
-    "CrossAttention",
-    "ImprovedPointNet2Encoder",
-    "SetAbstraction",
-    "ImprovedChunkFusion",
-    "DiffusionLoss"
+    'PointCloudDiffusionModel',
+    'DiffusionProcess',
+    'UnsupervisedPointCloudDiffusionModel',
+    'UnsupervisedDiffusionProcess',
+    'StyleEncoder',
+    'ContentEncoder',
+    'ImprovedPointNet2Encoder',
+    'ImprovedChunkFusion'
 ]

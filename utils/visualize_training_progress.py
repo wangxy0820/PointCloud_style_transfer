@@ -168,7 +168,7 @@ def visualize_epoch_progress(checkpoint_dir, sim_file, real_file, output_dir):
 
 
 if __name__ == "__main__":
-    checkpoint_dir = "experiments/test1/checkpoints"
+    checkpoint_dir = "experiments/my_experiment/checkpoints"
     sim_file = "datasets/simulation/000000.npy"
     real_file = "datasets/real_world/000000.npy"
     output_dir = "results/progress_monitor"

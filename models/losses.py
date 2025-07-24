@@ -68,8 +68,107 @@ def earth_mover_distance(pred: torch.Tensor, target: torch.Tensor) -> torch.Tens
     return torch.tensor(emd_loss, device=pred.device, dtype=pred.dtype)
 
 
+class UnsupervisedDiffusionLoss(nn.Module):
+    """无监督Diffusion模型的损失函数"""
+    
+    def __init__(self, 
+                 lambda_diffusion: float = 1.0,
+                 lambda_style: float = 0.5,
+                 lambda_content: float = 0.5,
+                 lambda_cycle: float = 1.0,
+                 lambda_identity: float = 0.5):
+        super().__init__()
+        self.lambda_diffusion = lambda_diffusion
+        self.lambda_style = lambda_style
+        self.lambda_content = lambda_content
+        self.lambda_cycle = lambda_cycle
+        self.lambda_identity = lambda_identity
+    
+    def diffusion_loss(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Diffusion去噪损失"""
+        return F.mse_loss(predicted, target)
+    
+    def style_consistency_loss(self, style1: torch.Tensor, style2: torch.Tensor) -> torch.Tensor:
+        """风格一致性损失 - 确保相同域的风格相似"""
+        return F.mse_loss(style1, style2)
+    
+    def content_preservation_loss(self, content1: torch.Tensor, content2: torch.Tensor) -> torch.Tensor:
+        """内容保持损失 - 确保内容编码器提取的特征一致"""
+        return F.mse_loss(content1, content2)
+    
+    def cycle_consistency_loss(self, x: torch.Tensor, x_cycle: torch.Tensor) -> torch.Tensor:
+        """循环一致性损失 - A->B->A应该回到原点"""
+        # 使用Chamfer距离作为点云的循环一致性损失
+        cd1, cd2 = chamfer_distance(x, x_cycle)
+        return (cd1 + cd2).mean() / 2
+    
+    def identity_loss(self, x: torch.Tensor, x_same: torch.Tensor) -> torch.Tensor:
+        """身份损失 - 同域转换应该保持不变"""
+        return F.mse_loss(x, x_same)
+    
+    def forward(self, 
+                pred_noise: torch.Tensor,
+                target_noise: torch.Tensor,
+                style_sim: Optional[torch.Tensor] = None,
+                style_real: Optional[torch.Tensor] = None,
+                content_original: Optional[torch.Tensor] = None,
+                content_generated: Optional[torch.Tensor] = None,
+                x_cycle: Optional[torch.Tensor] = None,
+                x_original: Optional[torch.Tensor] = None,
+                x_identity: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        计算总损失
+        Args:
+            pred_noise: 预测的噪声
+            target_noise: 目标噪声
+            style_sim: 仿真域的风格编码
+            style_real: 真实域的风格编码
+            content_original: 原始内容编码
+            content_generated: 生成后的内容编码
+            x_cycle: 循环重建的点云
+            x_original: 原始点云
+            x_identity: 身份映射的点云
+        """
+        losses = {}
+        
+        # 1. Diffusion损失（主要损失）
+        diff_loss = self.diffusion_loss(pred_noise, target_noise)
+        losses['diffusion'] = diff_loss
+        total_loss = self.lambda_diffusion * diff_loss
+        
+        # 2. 风格一致性损失（可选）
+        if style_sim is not None and style_real is not None:
+            # 不同域的风格应该不同（负样本）
+            # 这里使用最大化风格差异
+            style_diff = -F.mse_loss(style_sim, style_real)  # 负号使其最大化
+            losses['style_diff'] = style_diff
+            total_loss += self.lambda_style * style_diff
+        
+        # 3. 内容保持损失（可选）
+        if content_original is not None and content_generated is not None:
+            content_loss = self.content_preservation_loss(content_original, content_generated)
+            losses['content'] = content_loss
+            total_loss += self.lambda_content * content_loss
+        
+        # 4. 循环一致性损失（可选）
+        if x_cycle is not None and x_original is not None:
+            cycle_loss = self.cycle_consistency_loss(x_original, x_cycle)
+            losses['cycle'] = cycle_loss
+            total_loss += self.lambda_cycle * cycle_loss
+        
+        # 5. 身份损失（可选）
+        if x_identity is not None and x_original is not None:
+            identity_loss = self.identity_loss(x_original, x_identity)
+            losses['identity'] = identity_loss
+            total_loss += self.lambda_identity * identity_loss
+        
+        losses['total'] = total_loss
+        
+        return losses
+
+
 class DiffusionLoss(nn.Module):
-    """Diffusion模型的损失函数"""
+    """Diffusion模型的损失函数（监督版本）"""
     
     def __init__(self, 
                  lambda_reconstruction: float = 1.0,

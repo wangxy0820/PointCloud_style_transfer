@@ -125,17 +125,9 @@ python scripts/preprocess_data.py \
     --sim_dir datasets/simulation \
     --real_dir datasets/real_world \
     --output_dir datasets/processed \
-    --chunk_size 2048 \
+    --chunk_size 4096 \
     --overlap_ratio 0.3 \
-    --num_workers 1
-
-python scripts/preprocess_data.py \
-    --sim_dir datasets/simulation \
-    --real_dir datasets/real_world \
-    --output_dir datasets/processed \
-    --chunk_size 2048 \
-    --overlap_ratio 0.3 \
-    --sequential
+    --backup_old
 ```
 
 参数说明：
@@ -146,9 +138,16 @@ python scripts/preprocess_data.py \
 ### 步骤3: 训练模型
 
 ```bash
+#supervised training
 python scripts/train.py \
     --data_dir datasets/processed \
     --experiment_name my_experiment \
+    --batch_size 8 \
+    --num_epochs 40
+#unsupervised training
+python scripts/unsupervised_train.py \
+    --data_dir datasets/processed \
+    --experiment_name unsupervised_test \
     --batch_size 8 \
     --num_epochs 40
 ```
@@ -176,14 +175,27 @@ python scripts/test.py \
     --checkpoint experiments/my_experiment/checkpoints/best_model.pth \
     --test_data datasets/processed \
     --compute_all_metrics
+
+#unsupervised testing
+python scripts/unsupervised_test.py \
+    --checkpoint experiments/unsupervised_test/checkpoints/best_model.pth \
+    --test_data datasets/processed \
+    --compute_all_metrics
 ```
 
 ### 步骤5: 推理（转换新的点云）
 
 单个文件：
 ```bash
+#supervised inference
 python scripts/inference.py \
     --checkpoint checkpoints/best_model.pth \
+    --sim_input path/to/simulation.npy \
+    --real_reference path/to/reference.npy \
+    --output path/to/output.npy
+#unsupervised inference
+python scripts/unsupervised_inference.py \
+    --checkpoint experiments/unsupervised_test/checkpoints/best_model.pth \
     --sim_input path/to/simulation.npy \
     --real_reference path/to/reference.npy \
     --output path/to/output.npy
@@ -191,21 +203,29 @@ python scripts/inference.py \
 
 批量处理：
 ```bash
+#supervised inference
 python scripts/inference.py \
     --checkpoint checkpoints/best_model.pth \
     --sim_folder path/to/sim_folder \
     --real_reference path/to/real_reference.npy \
     --output_folder path/to/output_folder \
     --batch_process
+
+#unsupervised inference
+python scripts/unsupervised_inference.py \
+    --checkpoint experiments/unsupervised_test/checkpoints/best_model.pth \
+    --source datasets/test/000000.npy \
+    --reference datasets/real_world/000000.npy \
+    --output results/000000.npy
 ```
 
 ### 步骤6: 可视化结果
 
 ```bash
 python scripts/visualize_results.py \
-    --original path/to/original.npy \
-    --generated path/to/generated.npy \
-    --reference path/to/reference.npy \
+    --original datasets/simulation/000000.npy \
+    --generated results/000000.npy \
+    --reference datasets/real_world/000000.npy \
     --output_path visualization.png
 ```
 
