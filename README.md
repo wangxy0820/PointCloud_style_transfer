@@ -147,7 +147,7 @@ python scripts/train.py \
 #unsupervised training
 python scripts/unsupervised_train.py \
     --data_dir datasets/processed \
-    --experiment_name unsupervised_test \
+    --experiment_name unsupervised_test2 \
     --batch_size 8 \
     --num_epochs 40
 ```
@@ -178,7 +178,7 @@ python scripts/test.py \
 
 #unsupervised testing
 python scripts/unsupervised_test.py \
-    --checkpoint experiments/unsupervised_test/checkpoints/best_model.pth \
+    --checkpoint experiments/test1/checkpoints/latest.pth \
     --test_data datasets/processed \
     --compute_all_metrics
 ```
@@ -195,7 +195,7 @@ python scripts/inference.py \
     --output path/to/output.npy
 #unsupervised inference
 python scripts/unsupervised_inference.py \
-    --checkpoint experiments/unsupervised_test/checkpoints/best_model.pth \
+    --checkpoint experiments/unsupervised_test/checkpoints/latest.pth \
     --sim_input path/to/simulation.npy \
     --real_reference path/to/reference.npy \
     --output path/to/output.npy
@@ -213,7 +213,7 @@ python scripts/inference.py \
 
 #unsupervised inference
 python scripts/unsupervised_inference.py \
-    --checkpoint experiments/unsupervised_test/checkpoints/best_model.pth \
+    --checkpoint experiments/test1/checkpoints/latest.pth \
     --source datasets/test/000000.npy \
     --reference datasets/real_world/000000.npy \
     --output results/000000.npy

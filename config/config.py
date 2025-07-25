@@ -12,6 +12,7 @@ class Config:
     sim_data_dir: str = "datasets/simulation"
     real_data_dir: str = "datasets/real_world"
     processed_data_dir: str = "datasets/processed"
+    experiment_dir = str = "test1"
     
     # 点云参数 - 修改以支持更大的chunk
     total_points: int = 120000    # 完整点云点数
@@ -37,8 +38,8 @@ class Config:
     pointnet_channels: List[int] = (64, 128, 256, 512)
     latent_dim: int = 512
     time_embed_dim: int = 256
-    num_timesteps: int = 1000      # Diffusion步数
-    beta_schedule: str = "cosine"   # 噪声调度
+    num_timesteps: int = 100      # Diffusion步数
+    beta_schedule: str = "linear"   # 噪声调度
     
     # 训练参数 - 使用自动batch_size
     @property
@@ -66,7 +67,9 @@ class Config:
     lambda_reconstruction: float = 1.0
     lambda_perceptual: float = 0.5
     lambda_continuity: float = 0.5
-    lambda_boundary: float = 1.0   # 边界平滑损失
+    lambda_boundary: float = 1.0
+    lambda_content: float = 2.0     #内容保持权重
+    lambda_style: float = 0.05      #风格权重
     
     # 设备配置
     device: str = "cuda"

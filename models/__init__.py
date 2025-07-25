@@ -5,7 +5,8 @@ from .unsupervised_diffusion_model import (
     UnsupervisedPointCloudDiffusionModel, 
     UnsupervisedDiffusionProcess,
     StyleEncoder,
-    ContentEncoder
+    ContentEncoder,
+    PositionalEncodingWrapper
 )
 from .pointnet2_encoder import ImprovedPointNet2Encoder
 from .chunk_fusion import ImprovedChunkFusion
@@ -18,5 +19,6 @@ __all__ = [
     'StyleEncoder',
     'ContentEncoder',
     'ImprovedPointNet2Encoder',
-    'ImprovedChunkFusion'
+    'ImprovedChunkFusion',
+    'PositionalEncodingWrapper'
 ]

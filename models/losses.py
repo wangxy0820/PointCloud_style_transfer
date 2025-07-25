@@ -2,388 +2,199 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 
-def chamfer_distance(pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    计算Chamfer距离
-    Args:
-        pred: 预测点云 [B, N, 3]
-        target: 目标点云 [B, M, 3]
-    Returns:
-        两个方向的Chamfer距离
-    """
-    # 计算距离矩阵
-    dist_matrix = torch.cdist(pred, target, p=2)  # [B, N, M]
-    
-    # 最近邻距离
-    dist1 = torch.min(dist_matrix, dim=2)[0]  # [B, N]
-    dist2 = torch.min(dist_matrix, dim=1)[0]  # [B, M]
-    
-    # 平均距离
-    chamfer_dist1 = torch.mean(dist1, dim=1)  # [B]
-    chamfer_dist2 = torch.mean(dist2, dim=1)  # [B]
-    
-    return chamfer_dist1, chamfer_dist2
-
-
-def earth_mover_distance(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """
-    计算Earth Mover's Distance (近似)
-    Args:
-        pred: 预测点云 [B, N, 3]
-        target: 目标点云 [B, N, 3]
-    Returns:
-        EMD距离
-    """
-    batch_size, num_points, _ = pred.shape
-    
-    # 简化的EMD计算，使用最小二分图匹配的近似
-    emd_loss = []
-    
-    for b in range(batch_size):
-        # 计算成本矩阵
-        cost_matrix = torch.cdist(pred[b:b+1], target[b:b+1], p=2)[0]  # [N, N]
-        
-        # 贪心匹配
-        total_cost = 0
-        used_target = set()
-        
-        for i in range(num_points):
-            min_cost = float('inf')
-            best_j = -1
-            
-            for j in range(num_points):
-                if j not in used_target and cost_matrix[i, j] < min_cost:
-                    min_cost = cost_matrix[i, j]
-                    best_j = j
-            
-            if best_j != -1:
-                total_cost += min_cost
-                used_target.add(best_j)
-        
-        emd_loss.append(total_cost / num_points)
-    
-    return torch.tensor(emd_loss, device=pred.device, dtype=pred.dtype)
-
-
-class UnsupervisedDiffusionLoss(nn.Module):
-    """无监督Diffusion模型的损失函数"""
+class GeometryPreservingDiffusionLoss(nn.Module):
+    """专门为保持几何形状设计的Diffusion损失函数"""
     
     def __init__(self, 
                  lambda_diffusion: float = 1.0,
-                 lambda_style: float = 0.5,
-                 lambda_content: float = 0.5,
-                 lambda_cycle: float = 1.0,
-                 lambda_identity: float = 0.5):
+                 lambda_shape: float = 2.0,
+                 lambda_local: float = 1.0,
+                 lambda_content: float = 1.0,    # 添加内容损失权重
+                 lambda_style: float = 0.1,
+                 lambda_smooth: float = 0.5):
         super().__init__()
         self.lambda_diffusion = lambda_diffusion
-        self.lambda_style = lambda_style
+        self.lambda_shape = lambda_shape
+        self.lambda_local = lambda_local
         self.lambda_content = lambda_content
-        self.lambda_cycle = lambda_cycle
-        self.lambda_identity = lambda_identity
+        self.lambda_style = lambda_style
+        self.lambda_smooth = lambda_smooth
     
-    def diffusion_loss(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Diffusion去噪损失"""
-        return F.mse_loss(predicted, target)
+    def diffusion_loss(self, pred_noise: torch.Tensor, target_noise: torch.Tensor) -> torch.Tensor:
+        """基础Diffusion损失 - 学习去噪"""
+        return F.mse_loss(pred_noise, target_noise)
     
-    def style_consistency_loss(self, style1: torch.Tensor, style2: torch.Tensor) -> torch.Tensor:
-        """风格一致性损失 - 确保相同域的风格相似"""
-        return F.mse_loss(style1, style2)
+    def shape_preservation_loss(self, generated: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
+        """形状保持损失 - 确保生成的点云保持原始形状"""
+        batch_size = generated.shape[0]
+        
+        # 1. 全局形状保持 - 点云的整体分布
+        # 计算点云中心
+        gen_center = generated.mean(dim=1, keepdim=True)  # [B, 1, 3]
+        orig_center = original.mean(dim=1, keepdim=True)
+        center_loss = F.mse_loss(gen_center, orig_center)
+        
+        # 2. 点云的空间范围保持
+        # 计算各个维度的范围
+        gen_min = generated.min(dim=1)[0]  # [B, 3]
+        gen_max = generated.max(dim=1)[0]
+        orig_min = original.min(dim=1)[0]
+        orig_max = original.max(dim=1)[0]
+        
+        range_loss = F.mse_loss(gen_max - gen_min, orig_max - orig_min)
+        
+        # 3. 点云的主方向保持（使用简化的PCA）
+        # 中心化
+        gen_centered = generated - gen_center
+        orig_centered = original - orig_center
+        
+        # 计算协方差矩阵
+        gen_cov = torch.bmm(gen_centered.transpose(1, 2), gen_centered) / (generated.shape[1] - 1)
+        orig_cov = torch.bmm(orig_centered.transpose(1, 2), orig_centered) / (original.shape[1] - 1)
+        
+        # 使用Frobenius范数比较协方差矩阵
+        cov_loss = torch.norm(gen_cov - orig_cov, p='fro', dim=(1, 2)).mean()
+        
+        # 4. 点云密度分布保持
+        # 计算每个点到中心的距离分布
+        gen_dists = torch.norm(gen_centered, dim=2)  # [B, N]
+        orig_dists = torch.norm(orig_centered, dim=2)
+        
+        # 比较距离分布的统计量
+        gen_dist_mean = gen_dists.mean(dim=1)
+        gen_dist_std = gen_dists.std(dim=1)
+        orig_dist_mean = orig_dists.mean(dim=1)
+        orig_dist_std = orig_dists.std(dim=1)
+        
+        dist_loss = F.mse_loss(gen_dist_mean, orig_dist_mean) + F.mse_loss(gen_dist_std, orig_dist_std)
+        
+        # 组合所有形状损失
+        total_shape_loss = center_loss + range_loss * 0.5 + cov_loss * 0.1 + dist_loss * 0.5
+        
+        return total_shape_loss
     
-    def content_preservation_loss(self, content1: torch.Tensor, content2: torch.Tensor) -> torch.Tensor:
+    def local_structure_loss(self, generated: torch.Tensor, original: torch.Tensor, k: int = 16) -> torch.Tensor:
+        """局部结构损失 - 保持局部几何关系"""
+        batch_size = generated.shape[0]
+        total_loss = 0.0
+        
+        for b in range(batch_size):
+            # 计算原始点云的k近邻
+            orig_dists = torch.cdist(original[b], original[b])  # [N, N]
+            _, orig_indices = torch.topk(orig_dists, k=k+1, dim=1, largest=False)
+            orig_indices = orig_indices[:, 1:]  # 排除自身
+            
+            # 对于每个点，计算其k近邻的相对位置
+            orig_neighbors = original[b][orig_indices]  # [N, k, 3]
+            orig_relative = orig_neighbors - original[b].unsqueeze(1)  # [N, k, 3]
+            
+            # 生成点云的对应关系（假设点的顺序保持）
+            gen_neighbors = generated[b][orig_indices]  # [N, k, 3]
+            gen_relative = gen_neighbors - generated[b].unsqueeze(1)  # [N, k, 3]
+            
+            # 比较相对位置
+            local_loss = F.mse_loss(gen_relative, orig_relative)
+            total_loss += local_loss
+        
+        return total_loss / batch_size
+    
+    def style_consistency_loss(self, style_sim: torch.Tensor, style_real: torch.Tensor) -> torch.Tensor:
+        """风格一致性损失 - 学习目标域的风格"""
+        # 使用余弦相似度，让不同域的风格有所区别
+        cosine_sim = F.cosine_similarity(style_sim, style_real, dim=1)
+        # 我们希望风格有区别但不要完全相反
+        return (cosine_sim - 0.5).abs().mean()
+    
+    def smoothness_loss(self, generated: torch.Tensor) -> torch.Tensor:
+        """平滑性损失 - 避免生成的点云有异常的尖锐变化"""
+        # 计算点云的局部平滑度
+        batch_size = generated.shape[0]
+        smooth_loss = 0.0
+        
+        for b in range(batch_size):
+            # 计算最近的几个邻居
+            dists = torch.cdist(generated[b], generated[b])
+            _, indices = torch.topk(dists, k=5, dim=1, largest=False)
+            
+            # 计算到邻居的平均距离
+            neighbor_dists = dists.gather(1, indices[:, 1:])  # 排除自身
+            mean_dists = neighbor_dists.mean(dim=1)
+            
+            # 平滑度：邻居距离的方差应该小
+            smooth_loss += mean_dists.std()
+        
+        return smooth_loss / batch_size
+    
+    def content_preservation_loss(self, content_original: torch.Tensor, 
+                                 content_from_noisy: torch.Tensor) -> torch.Tensor:
         """内容保持损失 - 确保内容编码器提取的特征一致"""
-        return F.mse_loss(content1, content2)
-    
-    def cycle_consistency_loss(self, x: torch.Tensor, x_cycle: torch.Tensor) -> torch.Tensor:
-        """循环一致性损失 - A->B->A应该回到原点"""
-        # 使用Chamfer距离作为点云的循环一致性损失
-        cd1, cd2 = chamfer_distance(x, x_cycle)
-        return (cd1 + cd2).mean() / 2
-    
-    def identity_loss(self, x: torch.Tensor, x_same: torch.Tensor) -> torch.Tensor:
-        """身份损失 - 同域转换应该保持不变"""
-        return F.mse_loss(x, x_same)
+        # 1. 基础MSE损失
+        mse_loss = F.mse_loss(content_from_noisy, content_original)
+        
+        # 2. 确保内容特征有空间变化（不是常数）
+        # 计算空间方差
+        orig_spatial_var = content_original.var(dim=2, keepdim=True).mean()
+        noisy_spatial_var = content_from_noisy.var(dim=2, keepdim=True).mean()
+        
+        # 如果方差太小，说明内容编码器输出了常数
+        var_loss = F.relu(0.1 - orig_spatial_var) + F.relu(0.1 - noisy_spatial_var)
+        
+        # 3. 特征激活损失 - 防止内容特征死亡
+        activation_loss = F.relu(1.0 - content_original.abs().mean()) * 0.1
+        
+        return mse_loss + var_loss + activation_loss
     
     def forward(self, 
                 pred_noise: torch.Tensor,
                 target_noise: torch.Tensor,
-                style_sim: Optional[torch.Tensor] = None,
-                style_real: Optional[torch.Tensor] = None,
+                generated_points: Optional[torch.Tensor] = None,
+                original_points: Optional[torch.Tensor] = None,
                 content_original: Optional[torch.Tensor] = None,
-                content_generated: Optional[torch.Tensor] = None,
-                x_cycle: Optional[torch.Tensor] = None,
-                x_original: Optional[torch.Tensor] = None,
-                x_identity: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+                content_from_noisy: Optional[torch.Tensor] = None,
+                style_source: Optional[torch.Tensor] = None,
+                style_target: Optional[torch.Tensor] = None,
+                t: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        计算总损失
-        Args:
-            pred_noise: 预测的噪声
-            target_noise: 目标噪声
-            style_sim: 仿真域的风格编码
-            style_real: 真实域的风格编码
-            content_original: 原始内容编码
-            content_generated: 生成后的内容编码
-            x_cycle: 循环重建的点云
-            x_original: 原始点云
-            x_identity: 身份映射的点云
+        计算总损失（添加内容损失）
         """
         losses = {}
         
-        # 1. Diffusion损失（主要损失）
+        # 1. 基础Diffusion损失
         diff_loss = self.diffusion_loss(pred_noise, target_noise)
         losses['diffusion'] = diff_loss
         total_loss = self.lambda_diffusion * diff_loss
         
-        # 2. 风格一致性损失（可选）
-        if style_sim is not None and style_real is not None:
-            # 不同域的风格应该不同（负样本）
-            # 这里使用最大化风格差异
-            style_diff = -F.mse_loss(style_sim, style_real)  # 负号使其最大化
-            losses['style_diff'] = style_diff
-            total_loss += self.lambda_style * style_diff
-        
-        # 3. 内容保持损失（可选）
-        if content_original is not None and content_generated is not None:
-            content_loss = self.content_preservation_loss(content_original, content_generated)
+        # 2. 内容保持损失（新增）
+        if content_original is not None and content_from_noisy is not None:
+            content_loss = self.content_preservation_loss(content_original, content_from_noisy)
             losses['content'] = content_loss
             total_loss += self.lambda_content * content_loss
         
-        # 4. 循环一致性损失（可选）
-        if x_cycle is not None and x_original is not None:
-            cycle_loss = self.cycle_consistency_loss(x_original, x_cycle)
-            losses['cycle'] = cycle_loss
-            total_loss += self.lambda_cycle * cycle_loss
+        # 3. 形状保持损失
+        if generated_points is not None and original_points is not None:
+            shape_loss = self.shape_preservation_loss(generated_points, original_points)
+            losses['shape'] = shape_loss
+            total_loss += self.lambda_shape * shape_loss
+            
+            # 4. 局部结构损失
+            local_loss = self.local_structure_loss(generated_points, original_points)
+            losses['local'] = local_loss
+            total_loss += self.lambda_local * local_loss
+            
+            # 5. 平滑性损失
+            smooth_loss = self.smoothness_loss(generated_points)
+            losses['smooth'] = smooth_loss
+            total_loss += self.lambda_smooth * smooth_loss
         
-        # 5. 身份损失（可选）
-        if x_identity is not None and x_original is not None:
-            identity_loss = self.identity_loss(x_original, x_identity)
-            losses['identity'] = identity_loss
-            total_loss += self.lambda_identity * identity_loss
+        # 6. 风格损失
+        if style_source is not None and style_target is not None:
+            style_loss = self.style_consistency_loss(style_source, style_target)
+            losses['style'] = style_loss
+            total_loss += self.lambda_style * style_loss
         
         losses['total'] = total_loss
         
         return losses
-
-
-class DiffusionLoss(nn.Module):
-    """Diffusion模型的损失函数（监督版本）"""
-    
-    def __init__(self, 
-                 lambda_reconstruction: float = 1.0,
-                 lambda_perceptual: float = 0.5,
-                 lambda_continuity: float = 0.5,
-                 lambda_boundary: float = 1.0):
-        super().__init__()
-        self.lambda_reconstruction = lambda_reconstruction
-        self.lambda_perceptual = lambda_perceptual
-        self.lambda_continuity = lambda_continuity
-        self.lambda_boundary = lambda_boundary
-    
-    def reconstruction_loss(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """重建损失（MSE）"""
-        return F.mse_loss(predicted, target)
-    
-    def perceptual_loss(self, predicted_features: torch.Tensor, 
-                       target_features: torch.Tensor) -> torch.Tensor:
-        """感知损失"""
-        return F.mse_loss(predicted_features, target_features)
-    
-    def continuity_loss(self, points: torch.Tensor, k: int = 8) -> torch.Tensor:
-        """局部连续性损失"""
-        B, N, _ = points.shape
-        
-        # 计算k近邻
-        distances = torch.cdist(points, points)
-        _, indices = distances.topk(k=k+1, dim=-1, largest=False)
-        indices = indices[:, :, 1:]  # 排除自身
-        
-        # 获取邻居点
-        batch_indices = torch.arange(B).view(B, 1, 1).expand(B, N, k).to(points.device)
-        neighbors = points[batch_indices, indices]
-        
-        # 计算平滑度（邻居点的方差）
-        neighbor_mean = neighbors.mean(dim=2, keepdim=True)
-        smoothness = ((neighbors - neighbor_mean) ** 2).sum(dim=-1).mean()
-        
-        return smoothness
-    
-    def boundary_loss(self, chunk1: torch.Tensor, chunk2: torch.Tensor, 
-                     overlap_threshold: float = 0.1) -> torch.Tensor:
-        """边界平滑损失"""
-        # 找到最近的点对
-        dist_matrix = torch.cdist(chunk1, chunk2)
-        min_dists, _ = dist_matrix.min(dim=1)
-        
-        # 只考虑重叠区域的点
-        overlap_mask = min_dists < overlap_threshold
-        
-        if overlap_mask.sum() == 0:
-            return torch.tensor(0.0, device=chunk1.device)
-        
-        # 计算重叠点的距离损失
-        boundary_loss = min_dists[overlap_mask].mean()
-        
-        return boundary_loss
-    
-    def forward(self, predicted: torch.Tensor, target: torch.Tensor,
-                predicted_features: Optional[torch.Tensor] = None,
-                target_features: Optional[torch.Tensor] = None,
-                chunks: Optional[List[torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
-        """
-        计算总损失
-        """
-        losses = {}
-        
-        # 重建损失
-        recon_loss = self.reconstruction_loss(predicted, target)
-        losses['reconstruction'] = recon_loss
-        total_loss = self.lambda_reconstruction * recon_loss
-        
-        # 感知损失
-        if predicted_features is not None and target_features is not None:
-            percep_loss = self.perceptual_loss(predicted_features, target_features)
-            losses['perceptual'] = percep_loss
-            total_loss += self.lambda_perceptual * percep_loss
-        
-        # 连续性损失
-        cont_loss = self.continuity_loss(predicted)
-        losses['continuity'] = cont_loss
-        total_loss += self.lambda_continuity * cont_loss
-        
-        # 边界损失
-        if chunks is not None and len(chunks) > 1:
-            boundary_losses = []
-            for i in range(len(chunks) - 1):
-                b_loss = self.boundary_loss(chunks[i], chunks[i+1])
-                boundary_losses.append(b_loss)
-            
-            if boundary_losses:
-                avg_boundary_loss = torch.stack(boundary_losses).mean()
-                losses['boundary'] = avg_boundary_loss
-                total_loss += self.lambda_boundary * avg_boundary_loss
-        
-        losses['total'] = total_loss
-        
-        return losses
-
-
-class ChamferLoss(nn.Module):
-    """Chamfer距离损失"""
-    
-    def __init__(self, use_sqrt: bool = False):
-        super().__init__()
-        self.use_sqrt = use_sqrt
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        计算Chamfer损失
-        Args:
-            pred: 预测点云 [B, N, 3]
-            target: 目标点云 [B, M, 3]
-        Returns:
-            Chamfer损失
-        """
-        dist1, dist2 = chamfer_distance(pred, target)
-        
-        if self.use_sqrt:
-            dist1 = torch.sqrt(dist1 + 1e-8)
-            dist2 = torch.sqrt(dist2 + 1e-8)
-        
-        return torch.mean(dist1 + dist2)
-
-
-class EMDLoss(nn.Module):
-    """Earth Mover's Distance损失"""
-    
-    def __init__(self):
-        super().__init__()
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        计算EMD损失
-        Args:
-            pred: 预测点云 [B, N, 3]
-            target: 目标点云 [B, N, 3]
-        Returns:
-            EMD损失
-        """
-        emd = earth_mover_distance(pred, target)
-        return torch.mean(emd)
-
-
-class LocalContinuityLoss(nn.Module):
-    """局部连续性损失"""
-    
-    def __init__(self, k: int = 8, alpha: float = 0.5):
-        super().__init__()
-        self.k = k
-        self.alpha = alpha
-    
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        计算局部连续性损失
-        Args:
-            pred: 预测点云 [B, N, 3]
-            target: 目标点云 [B, N, 3]
-        Returns:
-            局部连续性损失
-        """
-        batch_size = pred.size(0)
-        device = pred.device
-        
-        total_loss = 0
-        
-        for b in range(batch_size):
-            # 获取单个点云
-            pred_pc = pred[b]  # [N, 3]
-            target_pc = target[b]  # [N, 3]
-            
-            # 计算预测点云的k近邻
-            pred_dist = torch.cdist(pred_pc.unsqueeze(0), pred_pc.unsqueeze(0))[0]  # [N, N]
-            _, pred_idx = torch.topk(pred_dist, k=self.k+1, dim=-1, largest=False)
-            pred_idx = pred_idx[:, 1:]  # [N, k], 排除自身
-            
-            # 计算目标点云的k近邻
-            target_dist = torch.cdist(target_pc.unsqueeze(0), target_pc.unsqueeze(0))[0]  # [N, N]
-            _, target_idx = torch.topk(target_dist, k=self.k+1, dim=-1, largest=False)
-            target_idx = target_idx[:, 1:]  # [N, k], 排除自身
-            
-            # 计算局部结构差异
-            # 1. 局部密度差异
-            pred_local_density = torch.mean(pred_dist.gather(1, pred_idx), dim=1)  # [N]
-            target_local_density = torch.mean(target_dist.gather(1, target_idx), dim=1)  # [N]
-            density_loss = F.mse_loss(pred_local_density, target_local_density)
-            
-            # 2. 局部方向一致性
-            # 计算每个点到其邻居的向量
-            pred_neighbors = pred_pc[pred_idx]  # [N, k, 3]
-            pred_vectors = pred_neighbors - pred_pc.unsqueeze(1)  # [N, k, 3]
-            pred_vectors_norm = F.normalize(pred_vectors, p=2, dim=2)  # 归一化
-            
-            target_neighbors = target_pc[target_idx]  # [N, k, 3]
-            target_vectors = target_neighbors - target_pc.unsqueeze(1)  # [N, k, 3]
-            target_vectors_norm = F.normalize(target_vectors, p=2, dim=2)  # 归一化
-            
-            # 计算局部方向的差异
-            direction_similarity = torch.sum(pred_vectors_norm * target_vectors_norm, dim=2)  # [N, k]
-            direction_loss = 1.0 - torch.mean(direction_similarity)
-            
-            # 3. 局部曲率差异（可选）
-            # 计算局部协方差矩阵的特征值来估计曲率
-            pred_centered = pred_neighbors - pred_pc.unsqueeze(1)  # [N, k, 3]
-            pred_cov = torch.bmm(pred_centered.transpose(1, 2), pred_centered) / self.k  # [N, 3, 3]
-            
-            target_centered = target_neighbors - target_pc.unsqueeze(1)  # [N, k, 3]
-            target_cov = torch.bmm(target_centered.transpose(1, 2), target_centered) / self.k  # [N, 3, 3]
-            
-            # 使用Frobenius范数计算协方差矩阵的差异
-            cov_diff = torch.norm(pred_cov - target_cov, p='fro', dim=(1, 2))  # [N]
-            curvature_loss = torch.mean(cov_diff)
-            
-            # 组合损失
-            local_loss = density_loss + self.alpha * direction_loss + (1 - self.alpha) * curvature_loss
-            total_loss += local_loss
-        
-        return total_loss / batch_size

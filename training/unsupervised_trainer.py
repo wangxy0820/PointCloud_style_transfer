@@ -15,7 +15,7 @@ from typing import Dict, Optional, List, Tuple
 import numpy as np
 
 from models.unsupervised_diffusion_model import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
-from models.losses import UnsupervisedDiffusionLoss
+from models.losses import GeometryPreservingDiffusionLoss
 from evaluation.metrics import PointCloudMetrics
 from utils.visualization import PointCloudVisualizer
 from utils.logger import Logger
@@ -67,12 +67,12 @@ class UnsupervisedDiffusionTrainer:
         )
         
         # 损失函数
-        self.criterion = UnsupervisedDiffusionLoss(
+        self.criterion = GeometryPreservingDiffusionLoss(
             lambda_diffusion=1.0,
-            lambda_style=0.1,
-            lambda_content=0.5,
-            lambda_cycle=0.5,
-            lambda_identity=0.1
+            lambda_shape=2.0,      # 形状保持最重要
+            lambda_local=1.0,      # 局部结构也重要
+            lambda_style=0.1,      # 风格次要
+            lambda_smooth=0.5
         )
         
         # EMA
@@ -108,7 +108,7 @@ class UnsupervisedDiffusionTrainer:
         self.logger.info("Unsupervised trainer initialized successfully")
     
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """单个训练步骤 - 无监督版本"""
+        """单个训练步骤 - 确保内容编码器被训练"""
         self.model.train()
         
         sim_points = batch['sim_points'].to(self.device)
@@ -118,23 +118,13 @@ class UnsupervisedDiffusionTrainer:
         
         # 随机选择转换方向
         if np.random.rand() > 0.5:
-            # Sim -> Real
             source_points = sim_points
-            target_domain = 'real'
-            
-            # 提取真实域的风格
-            with torch.no_grad():
-                target_style = self.model.style_encoder(real_points)
+            target_style = self.model.style_encoder(real_points)
         else:
-            # Real -> Sim
             source_points = real_points
-            target_domain = 'sim'
-            
-            # 提取仿真域的风格
-            with torch.no_grad():
-                target_style = self.model.style_encoder(sim_points)
+            target_style = self.model.style_encoder(sim_points)
         
-        # 提取源域的内容
+        # 提取内容（从干净的源点云）
         source_content = self.model.content_encoder(source_points)
         
         # 随机时间步
@@ -144,54 +134,36 @@ class UnsupervisedDiffusionTrainer:
         noise = torch.randn_like(source_points)
         noisy_points = self.diffusion_process.q_sample(source_points, t, noise)
         
-        # 预测噪声 - 使用目标域的风格
+        # 从噪声点云提取内容（这会产生梯度）
+        noisy_content = self.model.content_encoder(noisy_points)
+        
+        # 预测噪声 - 使用原始内容
         predicted_noise = self.model(
             noisy_points, t, 
             style_condition=target_style,
-            content_condition=source_content
+            content_condition=source_content  # 使用干净的内容
         )
+        
+        # 计算去噪后的点云
+        with torch.no_grad():
+            alpha_t = self.diffusion_process.alphas_cumprod[t][:, None, None]
+            sqrt_alpha_t = torch.sqrt(alpha_t)
+            sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+            x0_pred = (noisy_points - sqrt_one_minus_alpha_t * predicted_noise) / sqrt_alpha_t
+            generated_points = x0_pred
         
         # 计算损失
         losses = self.criterion(
             pred_noise=predicted_noise,
             target_noise=noise,
+            generated_points=generated_points,
+            original_points=source_points,
             content_original=source_content,
-            content_generated=self.model.content_encoder(noisy_points)
+            content_from_noisy=noisy_content,  # 传入噪声内容
+            style_source=self.model.style_encoder(source_points),
+            style_target=target_style,
+            t=t
         )
-        
-        # 可选：添加循环一致性损失（每N步）
-        if self.global_step % 10 == 0:
-            with torch.no_grad():
-                # 生成目标域的点云
-                generated = self.diffusion_process.sample(
-                    self.model,
-                    source_points.shape,
-                    style_condition=target_style,
-                    content_condition=source_content,
-                    num_inference_steps=50  # 快速采样
-                )
-                
-                # 反向转换
-                if target_domain == 'real':
-                    cycle_style = self.model.style_encoder(sim_points)
-                else:
-                    cycle_style = self.model.style_encoder(real_points)
-                
-                cycle_content = self.model.content_encoder(generated)
-                
-                # 生成循环点云
-                cycle_points = self.diffusion_process.sample(
-                    self.model,
-                    generated.shape,
-                    style_condition=cycle_style,
-                    content_condition=cycle_content,
-                    num_inference_steps=50
-                )
-            
-            # 循环一致性损失
-            cycle_loss = self.criterion.cycle_consistency_loss(source_points, cycle_points)
-            losses['cycle'] = cycle_loss
-            losses['total'] = losses['total'] + self.criterion.lambda_cycle * cycle_loss
         
         # 反向传播
         self.optimizer.zero_grad()
@@ -209,6 +181,18 @@ class UnsupervisedDiffusionTrainer:
         # 更新EMA
         if self.ema is not None:
             self.ema.update()
+        
+        # 在 train_step 中添加
+        if self.global_step % self.config.log_interval == 0:
+            # 记录内容编码器的统计信息
+            with torch.no_grad():
+                content_mean = source_content.mean().item()
+                content_std = source_content.std().item()
+                content_spatial_var = source_content.var(dim=2).mean().item()
+                
+            self.writer.add_scalar('debug/content_mean', content_mean, self.global_step)
+            self.writer.add_scalar('debug/content_std', content_std, self.global_step)
+            self.writer.add_scalar('debug/content_spatial_var', content_spatial_var, self.global_step)
         
         return {k: v.item() for k, v in losses.items()}
     

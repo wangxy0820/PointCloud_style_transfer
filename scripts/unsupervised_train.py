@@ -37,10 +37,10 @@ def main():
     parser = argparse.ArgumentParser(description='Train Unsupervised Point Cloud Style Transfer')
     
     # 必需参数
-    parser.add_argument('--data_dir', type=str, required=True, help='Preprocessed data directory')
+    parser.add_argument('--data_dir', type=str, default='None', help='Preprocessed data directory')
     
     # 实验配置
-    parser.add_argument('--experiment_name', type=str, default='unsupervised_diffusion')
+    parser.add_argument('--experiment_name', type=str, default='None')
     parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     
@@ -84,6 +84,7 @@ def main():
     config.log_interval = args.log_interval
     config.eval_interval = args.eval_interval
     
+    
     # 如果使用EMA
     if args.use_ema:
         config.ema_decay = 0.995
@@ -91,7 +92,7 @@ def main():
         config.ema_decay = 0
     
     # 更新路径
-    experiment_dir = os.path.join('experiments', args.experiment_name)
+    experiment_dir = os.path.join('experiments', config.experiment_dir)
     config.checkpoint_dir = os.path.join(experiment_dir, 'checkpoints')
     config.log_dir = os.path.join(experiment_dir, 'logs')
     config.result_dir = os.path.join(experiment_dir, 'results')
@@ -121,7 +122,7 @@ def main():
     logger.info("Creating data loaders...")
     try:
         train_loader, val_loader, test_loader = create_dataloaders(
-            args.data_dir,
+            config.processed_data_dir,
             config.batch_size,
             config.num_workers,
             config.chunk_size
