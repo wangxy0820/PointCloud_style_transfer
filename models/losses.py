@@ -6,15 +6,16 @@ from typing import Dict, Optional, Tuple
 
 
 class GeometryPreservingDiffusionLoss(nn.Module):
-    """专门为保持几何形状设计的Diffusion损失函数"""
+    """专门为保持几何形状设计的Diffusion损失函数 - LiDAR增强版"""
     
     def __init__(self, 
                  lambda_diffusion: float = 1.0,
                  lambda_shape: float = 2.0,
                  lambda_local: float = 1.0,
-                 lambda_content: float = 1.0,    # 添加内容损失权重
-                 lambda_style: float = 0.1,
-                 lambda_smooth: float = 0.5):
+                 lambda_content: float = 2.0,    # 增加内容损失权重
+                 lambda_style: float = 0.02,     # 减小风格权重
+                 lambda_smooth: float = 0.5,
+                 lambda_lidar_structure: float = 0.5):  # 新增LiDAR结构损失
         super().__init__()
         self.lambda_diffusion = lambda_diffusion
         self.lambda_shape = lambda_shape
@@ -22,6 +23,7 @@ class GeometryPreservingDiffusionLoss(nn.Module):
         self.lambda_content = lambda_content
         self.lambda_style = lambda_style
         self.lambda_smooth = lambda_smooth
+        self.lambda_lidar_structure = lambda_lidar_structure
     
     def diffusion_loss(self, pred_noise: torch.Tensor, target_noise: torch.Tensor) -> torch.Tensor:
         """基础Diffusion损失 - 学习去噪"""
@@ -101,6 +103,87 @@ class GeometryPreservingDiffusionLoss(nn.Module):
         
         return total_loss / batch_size
     
+    def lidar_structure_loss(self, generated: torch.Tensor, original: torch.Tensor) -> torch.Tensor:
+        """LiDAR特定的结构保持损失 - 修复版本，避免数值爆炸"""
+        batch_size = generated.shape[0]
+        total_loss = 0.0
+        
+        for b in range(batch_size):
+            gen = generated[b]  # [N, 3]
+            orig = original[b]  # [N, 3]
+            
+            # 1. 转换到球坐标系
+            # 原始点云
+            orig_r = torch.norm(orig[:, :2], dim=1).clamp(min=1e-6)  # XY平面距离，避免除零
+            orig_theta = torch.atan2(orig[:, 1], orig[:, 0])  # 水平角
+            orig_z = orig[:, 2]  # 高度
+            
+            # 生成点云
+            gen_r = torch.norm(gen[:, :2], dim=1).clamp(min=1e-6)
+            gen_theta = torch.atan2(gen[:, 1], gen[:, 0])
+            gen_z = gen[:, 2]
+            
+            # 2. 角度分布损失 - 保持水平扫描模式
+            # 使用MSE而不是KL散度，避免数值问题
+            n_bins = 36  # 每10度一个bin
+            theta_bins = torch.linspace(-np.pi, np.pi, n_bins + 1).to(orig.device)
+            
+            # 计算角度直方图
+            orig_hist = torch.histc(orig_theta, bins=n_bins, min=-np.pi, max=np.pi)
+            gen_hist = torch.histc(gen_theta, bins=n_bins, min=-np.pi, max=np.pi)
+            
+            # 归一化直方图
+            orig_hist = orig_hist / (orig_hist.sum() + 1e-8)
+            gen_hist = gen_hist / (gen_hist.sum() + 1e-8)
+            
+            # 使用MSE计算分布差异
+            angle_distribution_loss = F.mse_loss(gen_hist, orig_hist)
+            
+            # 3. 垂直分布损失 - 保持垂直扫描线
+            # 计算高度分布的统计量
+            z_mean_diff = (gen_z.mean() - orig_z.mean()).abs()
+            z_std_diff = (gen_z.std() - orig_z.std()).abs()
+            vertical_distribution_loss = z_mean_diff + z_std_diff
+            
+            # 4. 局部连续性损失
+            # 按角度排序后检查相邻点的连续性
+            _, orig_sort_idx = torch.sort(orig_theta)
+            _, gen_sort_idx = torch.sort(gen_theta)
+            
+            # 取前100个点计算，避免计算量过大
+            n_samples = min(100, len(orig_sort_idx) - 1)
+            orig_sorted = orig[orig_sort_idx[:n_samples]]
+            gen_sorted = gen[gen_sort_idx[:n_samples]]
+            
+            # 相邻点的距离应该相似
+            orig_diffs = orig_sorted[1:] - orig_sorted[:-1]
+            gen_diffs = gen_sorted[1:] - gen_sorted[:-1]
+            
+            # 使用相对差异，避免绝对值过大
+            diff_norms_orig = torch.norm(orig_diffs, dim=1).clamp(min=1e-6)
+            diff_norms_gen = torch.norm(gen_diffs, dim=1).clamp(min=1e-6)
+            
+            # 计算相对差异
+            continuity_loss = ((diff_norms_gen - diff_norms_orig) / (diff_norms_orig + 1e-6)).abs().mean()
+            
+            # 5. 径向距离分布损失（简化版）
+            # 只比较统计量，不排序
+            radial_mean_diff = (gen_r.mean() - orig_r.mean()).abs()
+            radial_std_diff = (gen_r.std() - orig_r.std()).abs()
+            radial_loss = (radial_mean_diff + radial_std_diff) * 0.1  # 缩小权重
+            
+            # 组合所有LiDAR特定损失（使用更平衡的权重）
+            lidar_loss = (
+                angle_distribution_loss * 1.0 +    # 角度分布
+                vertical_distribution_loss * 0.1 + # 垂直分布
+                continuity_loss * 0.5 +           # 连续性
+                radial_loss * 0.5                 # 径向分布
+            )
+            
+            total_loss += lidar_loss
+        
+        return total_loss / batch_size
+    
     def style_consistency_loss(self, style_sim: torch.Tensor, style_real: torch.Tensor) -> torch.Tensor:
         """风格一致性损失 - 学习目标域的风格"""
         # 使用余弦相似度，让不同域的风格有所区别
@@ -158,7 +241,7 @@ class GeometryPreservingDiffusionLoss(nn.Module):
                 style_target: Optional[torch.Tensor] = None,
                 t: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """
-        计算总损失（添加内容损失）
+        计算总损失（添加LiDAR结构损失）
         """
         losses = {}
         
@@ -167,7 +250,7 @@ class GeometryPreservingDiffusionLoss(nn.Module):
         losses['diffusion'] = diff_loss
         total_loss = self.lambda_diffusion * diff_loss
         
-        # 2. 内容保持损失（新增）
+        # 2. 内容保持损失
         if content_original is not None and content_from_noisy is not None:
             content_loss = self.content_preservation_loss(content_original, content_from_noisy)
             losses['content'] = content_loss
@@ -188,8 +271,13 @@ class GeometryPreservingDiffusionLoss(nn.Module):
             smooth_loss = self.smoothness_loss(generated_points)
             losses['smooth'] = smooth_loss
             total_loss += self.lambda_smooth * smooth_loss
+            
+            # 6. LiDAR结构损失（新增）
+            lidar_loss = self.lidar_structure_loss(generated_points, original_points)
+            losses['lidar_structure'] = lidar_loss
+            total_loss += self.lambda_lidar_structure * lidar_loss
         
-        # 6. 风格损失
+        # 7. 风格损失
         if style_source is not None and style_target is not None:
             style_loss = self.style_consistency_loss(style_source, style_target)
             losses['style'] = style_loss

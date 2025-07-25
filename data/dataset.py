@@ -7,18 +7,19 @@ from typing import List, Tuple, Dict, Optional
 import random
 import warnings
 
-from .augmentation import PointCloudAugmentation
+from .augmentation import PointCloudAugmentation, create_lidar_augmentation
 
 
 class PointCloudStyleTransferDataset(Dataset):
-    """点云风格转换数据集 - 支持不同chunk size"""
+    """点云风格转换数据集 - 支持LiDAR模式"""
     
     def __init__(self, 
                  data_dir: str,
                  split: str = 'train',
                  chunk_size: int = 2048,
                  augment: bool = True,
-                 max_chunks_per_sample: int = None):
+                 max_chunks_per_sample: int = None,
+                 config: Optional[object] = None):  # 添加config参数
         """
         Args:
             data_dir: 预处理数据的根目录
@@ -26,12 +27,14 @@ class PointCloudStyleTransferDataset(Dataset):
             chunk_size: 每个块的点数
             augment: 是否进行数据增强
             max_chunks_per_sample: 每个样本最多使用多少个块（用于渐进式训练）
+            config: 配置对象，用于获取LiDAR特定设置
         """
         self.data_dir = data_dir
         self.split = split
         self.chunk_size = chunk_size
         self.augment = augment
         self.max_chunks_per_sample = max_chunks_per_sample
+        self.config = config
         
         # 获取该split的目录
         self.split_dir = os.path.join(data_dir, split)
@@ -53,11 +56,16 @@ class PointCloudStyleTransferDataset(Dataset):
         
         # 数据增强
         if augment and split == 'train':
-            self.augmentation = PointCloudAugmentation(
-                rotation_range=0.1,
-                jitter_std=0.01,
-                scale_range=(0.95, 1.05)
-            )
+            if config is not None:
+                # 使用LiDAR友好的数据增强
+                self.augmentation = create_lidar_augmentation(config)
+            else:
+                # 使用默认数据增强
+                self.augmentation = PointCloudAugmentation(
+                    rotation_range=0.05,  # LiDAR友好的参数
+                    jitter_std=0.005,
+                    scale_range=(0.98, 1.02)
+                )
         else:
             self.augmentation = None
     
@@ -85,6 +93,11 @@ class PointCloudStyleTransferDataset(Dataset):
         
         # 获取数据的chunk_size
         self.data_chunk_size = sample_data.get('chunk_size', 2048)
+        
+        # 检查是否使用了LiDAR标准化
+        self.use_lidar_normalization = sample_data.get('use_lidar_normalization', False)
+        if self.use_lidar_normalization:
+            print(f"Dataset was preprocessed with LiDAR normalization")
         
         # 检查第一个chunk的实际大小
         if 'sim_chunks' in sample_data and len(sample_data['sim_chunks']) > 0:
@@ -157,6 +170,7 @@ class PointCloudStyleTransferDataset(Dataset):
             'num_chunks': num_chunks,
             'file_idx': idx,
             'data_chunk_size': self.data_chunk_size,
+            'use_lidar_normalization': self.use_lidar_normalization,
             'norm_params': data.get('norm_params', {
                 'sim': data.get('sim_norm_params', {}),
                 'real': data.get('real_norm_params', {})
@@ -185,10 +199,13 @@ def create_dataloaders(data_dir: str,
                       num_workers: int = 4,
                       chunk_size: int = 2048,
                       pin_memory: bool = True,
-                      max_chunks_per_sample: int = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
-    """创建数据加载器 - 自动适应数据的chunk_size"""
+                      max_chunks_per_sample: int = None,
+                      config: Optional[object] = None) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """创建数据加载器 - 支持LiDAR配置"""
     
     print(f"Creating dataloaders with requested chunk_size={chunk_size}")
+    if config and config.use_lidar_normalization:
+        print(f"Using LiDAR-aware data loading")
     
     # 创建数据集
     train_dataset = PointCloudStyleTransferDataset(
@@ -196,7 +213,8 @@ def create_dataloaders(data_dir: str,
         split='train', 
         chunk_size=chunk_size, 
         augment=True,
-        max_chunks_per_sample=max_chunks_per_sample
+        max_chunks_per_sample=max_chunks_per_sample,
+        config=config
     )
     
     val_dataset = PointCloudStyleTransferDataset(
@@ -204,7 +222,8 @@ def create_dataloaders(data_dir: str,
         split='val', 
         chunk_size=chunk_size, 
         augment=False,
-        max_chunks_per_sample=max_chunks_per_sample
+        max_chunks_per_sample=max_chunks_per_sample,
+        config=config
     )
     
     test_dataset = PointCloudStyleTransferDataset(
@@ -212,7 +231,8 @@ def create_dataloaders(data_dir: str,
         split='test', 
         chunk_size=chunk_size, 
         augment=False,
-        max_chunks_per_sample=max_chunks_per_sample
+        max_chunks_per_sample=max_chunks_per_sample,
+        config=config
     )
     
     # 获取实际使用的chunk_size（可能与请求的不同）
@@ -271,13 +291,19 @@ if __name__ == "__main__":
     print(f"Testing data loading from: {data_dir}")
     print(f"Requested chunk_size: {chunk_size}")
     
+    # 创建测试配置
+    from config import Config
+    test_config = Config()
+    test_config.use_lidar_normalization = True
+    
     try:
         # 测试创建数据加载器
         train_loader, val_loader, test_loader = create_dataloaders(
             data_dir=data_dir,
             batch_size=4,
             num_workers=0,
-            chunk_size=chunk_size
+            chunk_size=chunk_size,
+            config=test_config
         )
         
         print(f"Train batches: {len(train_loader)}")
@@ -293,6 +319,7 @@ if __name__ == "__main__":
             print(f"  chunk_idx: {batch['chunk_idx']}")
             print(f"  num_chunks: {batch['num_chunks']}")
             print(f"  data_chunk_size: {batch['data_chunk_size'][0]}")
+            print(f"  use_lidar_normalization: {batch['use_lidar_normalization'][0]}")
         
     except Exception as e:
         print(f"Error: {e}")

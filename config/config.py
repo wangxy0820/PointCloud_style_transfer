@@ -5,20 +5,24 @@ from typing import List, Tuple
 
 @dataclass
 class Config:
-    """改进的配置类 - 支持更大的chunk_size"""
+    """改进的配置类 - 支持LiDAR点云处理"""
     
     # 数据配置
     data_root: str = "datasets"
     sim_data_dir: str = "datasets/simulation"
     real_data_dir: str = "datasets/real_world"
     processed_data_dir: str = "datasets/processed"
-    experiment_dir = str = "test1"
+    experiment_dir: str = "test1"
     
     # 点云参数 - 修改以支持更大的chunk
     total_points: int = 120000    # 完整点云点数
     chunk_size: int = 4096        # 增大到4096（可选：2048, 4096, 8192, 16384）
     overlap_ratio: float = 0.2    # 减小重叠率以适应更大的chunk
     num_chunks_per_pc: int = 40   # 减少块数因为每块更大了
+    
+    # LiDAR特定配置（新增）
+    use_lidar_normalization: bool = True  # 使用LiDAR友好的标准化
+    use_lidar_chunking: bool = True       # 使用LiDAR感知的分块策略
     
     # 根据chunk_size自动调整batch_size
     @property
@@ -63,13 +67,19 @@ class Config:
     chunks_increment: int = 10     # 每个阶段增加10个块
     progressive_epochs: int = 20   # 每个阶段的训练轮数
     
-    # 损失权重
+    # 损失权重 - 针对LiDAR调整
     lambda_reconstruction: float = 1.0
     lambda_perceptual: float = 0.5
     lambda_continuity: float = 0.5
     lambda_boundary: float = 1.0
-    lambda_content: float = 2.0     #内容保持权重
-    lambda_style: float = 0.05      #风格权重
+    lambda_content: float = 2.0         # 减小内容权重
+    lambda_style: float = 0.01          # 进一步减小风格权重
+    lambda_lidar_structure: float = 0.5 # 大幅减小LiDAR结构损失权重
+    
+    # 数据增强参数 - 针对LiDAR调整
+    augmentation_rotation_range: float = 0.05   # 减小旋转范围
+    augmentation_jitter_std: float = 0.005      # 减小抖动
+    augmentation_scale_range: Tuple[float, float] = (0.98, 1.02)  # 减小缩放范围
     
     # 设备配置
     device: str = "cuda"
@@ -99,6 +109,7 @@ class Config:
         print(f"Configuration initialized:")
         print(f"  Chunk size: {self.chunk_size}")
         print(f"  Batch size: {self.batch_size}")
+        print(f"  LiDAR mode: {self.use_lidar_normalization}")
         print(f"  Estimated memory per batch: ~{self._estimate_memory_usage():.1f} GB")
     
     def _validate_chunk_config(self):

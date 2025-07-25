@@ -126,8 +126,8 @@ python scripts/preprocess_data.py \
     --real_dir datasets/real_world \
     --output_dir datasets/processed \
     --chunk_size 4096 \
-    --overlap_ratio 0.3 \
-    --backup_old
+    --overlap_ratio 0.2 \
+    --use_lidar_mode
 ```
 
 参数说明：
@@ -145,11 +145,7 @@ python scripts/train.py \
     --batch_size 8 \
     --num_epochs 40
 #unsupervised training
-python scripts/unsupervised_train.py \
-    --data_dir datasets/processed \
-    --experiment_name unsupervised_test2 \
-    --batch_size 8 \
-    --num_epochs 40
+python scripts/unsupervised_train.py
 ```
 
 高级训练选项：
