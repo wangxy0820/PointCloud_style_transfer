@@ -12,7 +12,7 @@ from mpl_toolkits.mplot3d import Axes3D
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.unsupervised_diffusion_model import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
+from models.diffusion_model_unsupervised import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
 from data.dataset import PointCloudStyleTransferDataset
 from torch.utils.data import DataLoader
 

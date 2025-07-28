@@ -14,8 +14,8 @@ import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.config import Config
-from models.unsupervised_diffusion_model import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
+from config.config_unsupervised import ConfigUnsupervised
+from models.diffusion_model_unsupervised import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
 from models.chunk_fusion import ImprovedChunkFusion
 from data.preprocessing import ImprovedPointCloudPreprocessor
 from utils.visualization import PointCloudVisualizer
@@ -24,6 +24,7 @@ from utils.logger import Logger
 
 class UnsupervisedDiffusionInference:
     """无监督Diffusion模型推理"""
+    config = ConfigUnsupervised()
     
     def __init__(self, checkpoint_path: str, device: str = 'cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')

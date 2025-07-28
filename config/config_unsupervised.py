@@ -4,78 +4,69 @@ from typing import List, Tuple
 
 
 @dataclass
-class Config:
-    """改进的配置类 - 支持LiDAR点云处理"""
+class ConfigUnsupervised:
+    """无监督模型的专属配置"""
     
-    # 数据配置
+    # --- 实验与路径 ---
+    experiment_name: str = "test2"
     data_root: str = "datasets"
+    processed_data_dir: str = os.path.join(data_root, "processed")
     sim_data_dir: str = "datasets/simulation"
     real_data_dir: str = "datasets/real_world"
-    processed_data_dir: str = "datasets/processed"
-    experiment_dir: str = "test1"
     
     # 点云参数 - 修改以支持更大的chunk
     total_points: int = 120000    # 完整点云点数
     chunk_size: int = 4096        # 增大到4096（可选：2048, 4096, 8192, 16384）
     overlap_ratio: float = 0.2    # 减小重叠率以适应更大的chunk
-    num_chunks_per_pc: int = 40   # 减少块数因为每块更大了
     
-    # LiDAR特定配置（新增）
+    # LiDAR特定配置
     use_lidar_normalization: bool = True  # 使用LiDAR友好的标准化
     use_lidar_chunking: bool = True       # 使用LiDAR感知的分块策略
     
-    # 根据chunk_size自动调整batch_size
-    @property
-    def auto_batch_size(self) -> int:
-        """根据chunk_size自动计算合适的batch_size"""
-        if self.chunk_size <= 2048:
-            return 8
-        elif self.chunk_size <= 4096:
-            return 4
-        elif self.chunk_size <= 8192:
-            return 2
-        else:  # 16384 or larger
-            return 1
-    
-    # 模型参数 - Diffusion Model
-    model_type: str = "diffusion" 
-    pointnet_channels: List[int] = (64, 128, 256, 512)
-    latent_dim: int = 512
+     # --- 模型参数 ---
     time_embed_dim: int = 256
-    num_timesteps: int = 100      # Diffusion步数
-    beta_schedule: str = "linear"   # 噪声调度
+    num_timesteps: int = 1000  # CHANGED: 增加步数以获得更稳定的训练
+    beta_schedule: str = "cosine" # CHANGED: 余弦调度通常效果更好
+        
+    # --- 训练参数 ---
+    num_epochs: int = 100 # 建议增加训练轮数
+    learning_rate: float = 3e-5
+    weight_decay: float = 1e-4
+    ema_decay: float = 0.995
+    gradient_clip: float = 1.0
+    warmup_steps: int = 1000
     
-    # 训练参数 - 使用自动batch_size
+    # --- 自动批处理大小 ---
+    _batch_size: int = None
     @property
     def batch_size(self) -> int:
-        return self._batch_size if hasattr(self, '_batch_size') else self.auto_batch_size
+        if self._batch_size is not None:
+            return self._batch_size
+        # 根据chunk_size自动计算
+        if self.chunk_size <= 2048: return 8
+        if self.chunk_size <= 4096: return 4
+        if self.chunk_size <= 8192: return 2
+        return 1
     
+    # 训练参数 - 使用自动batch_size
     @batch_size.setter
     def batch_size(self, value: int):
         self._batch_size = value
+
     
-    # 默认训练参数
-    num_epochs: int = 40
-    learning_rate: float = 0.0001
-    weight_decay: float = 0.0001
-    ema_decay: float = 0.995       # EMA用于稳定训练
-    gradient_clip: float = 1.0
-    warmup_steps=1000
+    # --- 渐进式训练 (可选) ---
+    progressive_training: bool = False # 建议先关闭以简化调试
+    initial_chunks: int = 10
+    chunks_increment: int = 10
+    progressive_epochs: int = 20
     
-    # 渐进式训练
-    progressive_training: bool = True
-    initial_chunks: int = 10       # 开始时只用10个块
-    chunks_increment: int = 10     # 每个阶段增加10个块
-    progressive_epochs: int = 20   # 每个阶段的训练轮数
-    
-    # 损失权重 - 针对LiDAR调整
-    lambda_reconstruction: float = 1.0
-    lambda_perceptual: float = 0.5
-    lambda_continuity: float = 0.5
-    lambda_boundary: float = 1.0
-    lambda_content: float = 2.0         # 减小内容权重
-    lambda_style: float = 0.01          # 进一步减小风格权重
-    lambda_lidar_structure: float = 0.1 # 大幅减小LiDAR结构损失权重
+    # --- 损失权重 (核心修改) ---
+    lambda_diffusion: float = 1.0
+    lambda_chamfer: float = 1.0          # ADDED: 使用Chamfer Loss作为主要的几何约束
+    lambda_content: float = 2.0          # 内容编码器的一致性
+    lambda_style: float = 0.01           # 风格损失，保持较低
+    lambda_lidar_structure: float = 0.5  # LiDAR结构损失，可以适当提高
+    lambda_smooth: float = 0.5           # 平滑度损失，防止噪点
     
     # 数据增强参数 - 针对LiDAR调整
     augmentation_rotation_range: float = 0.05   # 减小旋转范围
@@ -87,7 +78,7 @@ class Config:
     num_workers: int = 4
     
     # 训练配置
-    save_interval: int = 10        # 保存检查点间隔
+    save_interval: int = 5        # 保存检查点间隔
     log_interval: int = 50         # 日志记录间隔
     eval_interval: int = 1         # 验证间隔
     

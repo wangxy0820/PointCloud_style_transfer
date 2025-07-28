@@ -15,9 +15,9 @@ import logging
 # 添加项目根目录
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.config import Config
+from config.config_unsupervised import ConfigUnsupervised
 from data.dataset import create_dataloaders
-from training.unsupervised_trainer import UnsupervisedDiffusionTrainer
+from training.trainer_unsupervised import UnsupervisedDiffusionTrainer
 from utils.logger import Logger
 from utils.checkpoint import CheckpointManager
 
@@ -66,7 +66,7 @@ def main():
     set_seed(args.seed)
     
     # 创建配置
-    config = Config()
+    config = ConfigUnsupervised()
     
     # 覆盖配置参数
     if args.batch_size is not None:
@@ -92,10 +92,10 @@ def main():
         config.ema_decay = 0
     
     # 更新路径
-    experiment_dir = os.path.join('experiments', config.experiment_dir)
-    config.checkpoint_dir = os.path.join(experiment_dir, 'checkpoints')
-    config.log_dir = os.path.join(experiment_dir, 'logs')
-    config.result_dir = os.path.join(experiment_dir, 'results')
+    experiment_name = os.path.join('experiments', config.experiment_name)
+    config.checkpoint_dir = os.path.join(experiment_name, 'checkpoints')
+    config.log_dir = os.path.join(experiment_name, 'logs')
+    config.result_dir = os.path.join(experiment_name, 'results')
     
     # 创建目录
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -114,7 +114,7 @@ def main():
     
     # 保存配置
     import json
-    config_path = os.path.join(experiment_dir, 'config.json')
+    config_path = os.path.join(experiment_name, 'config.json')
     with open(config_path, 'w') as f:
         json.dump(config.__dict__, f, indent=2)
     
@@ -181,7 +181,7 @@ def main():
         logger.error(f"Training failed: {e}")
         raise
     
-    logger.info(f"Experiment completed. Results saved to: {experiment_dir}")
+    logger.info(f"Experiment completed. Results saved to: {experiment_name}")
 
 
 if __name__ == "__main__":

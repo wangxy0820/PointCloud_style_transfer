@@ -14,8 +14,8 @@ from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config.config import Config
-from models.unsupervised_diffusion_model import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
+from config.config_unsupervised import ConfigUnsupervised
+from models.diffusion_model_unsupervised import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
 from data.dataset import PointCloudStyleTransferDataset
 from evaluation.metrics import PointCloudMetrics
 from utils.visualization import PointCloudVisualizer

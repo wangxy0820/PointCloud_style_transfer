@@ -1,3 +1,5 @@
+# models/unsupervised_diffusion_model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -123,7 +125,7 @@ class StyleEncoder(nn.Module):
 
 
 class ContentEncoder(nn.Module):
-    """内容编码器 - 保留几何结构"""
+    """内容编码器 - 保留几何结构 (已修改)"""
     
     def __init__(self, input_dim: int = 3, hidden_dims: List[int] = [64, 128, 256]):
         super().__init__()
@@ -168,8 +170,9 @@ class ContentEncoder(nn.Module):
         combined = torch.cat([h, coord_features], dim=1)
         content = self.fusion(combined)
         
-        # 确保输出不是零
-        content = content + 0.1 * x.mean(dim=1, keepdim=True)  # 添加小的偏置
+        # REMOVED: 移除了可能导致模型坍塌的全局平均值偏置。
+        # 这个操作会污染局部几何特征，使模型倾向于生成平均化的“团状”结构。
+        # content = content + 0.1 * x.mean(dim=1, keepdim=True)
         
         return content
 
@@ -184,8 +187,7 @@ class PositionalEncoding(nn.Module):
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         
         if d_model >= 2:
-            div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
-                               (-math.log(10000.0) / d_model))
+            div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
             pe[:, 0::2] = torch.sin(position * div_term)
             if d_model % 2 == 0:
                 pe[:, 1::2] = torch.cos(position * div_term)
@@ -201,7 +203,7 @@ class PositionalEncoding(nn.Module):
 
 
 class SpatialAwareStyleModulation(nn.Module):
-    """空间感知的风格调制 - 不破坏结构"""
+    """空间感知的风格调制 - 不破坏结构 (已修改)"""
     
     def __init__(self, feature_channels: int, style_dim: int):
         super().__init__()
@@ -238,21 +240,21 @@ class SpatialAwareStyleModulation(nn.Module):
         # 计算空间注意力
         spatial_weight = self.spatial_attention(features)  # [B, 1, N]
         
-        # 简化的归一化 - 避免维度不匹配
-        # 使用全局统计而不是局部统计
+        # 使用全局统计进行归一化
         mean = features.mean(dim=2, keepdim=True)  # [B, C, 1]
         std = features.std(dim=2, keepdim=True) + 1e-5  # [B, C, 1]
         normalized = (features - mean) / std
         
-        # 应用风格调制（带空间权重）
+        # 应用风格调制
         scale = scale[:, :, None]  # [B, C, 1]
         shift = shift[:, :, None]  # [B, C, 1]
         
-        # 空间自适应调制 - 使用较小的系数
         modulated = normalized * (1 + scale * spatial_weight * 0.1) + shift * spatial_weight * 0.1
         
         # 与原始特征混合（保持结构）
-        alpha = 0.3  # 调制强度
+        # CHANGED: 将alpha从0.3降低到0.1，使风格调制成为更精细的微调，
+        # 避免不稳定的风格特征过度破坏原始的几何特征。
+        alpha = 0.1
         output = features * (1 - alpha) + modulated * alpha
         
         return output
@@ -330,12 +332,6 @@ class UnsupervisedPointCloudDiffusionModel(nn.Module):
         self.hidden_dims = hidden_dims
         self.style_dim = style_dim
         
-        # 打印架构信息
-        print("Fixed Model Architecture:")
-        print(f"  Hidden dimensions: {hidden_dims}")
-        print(f"  Style dimension: {style_dim}")
-        print(f"  Content dimensions: {content_dims}")
-        print(f"  Style modulation: Spatial-aware with attention")
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, 
             style_condition: Optional[torch.Tensor] = None,
@@ -375,7 +371,6 @@ class UnsupervisedPointCloudDiffusionModel(nn.Module):
             h = block(h, time_emb)
             # 轻量级风格调制 - 使用正确的索引
             if style_condition is not None:
-                # encoder_blocks[i]的输出维度是hidden_dims[i+1]
                 h = self.style_modulation[i+1](h, style_condition)
             skip_connections.append(h)
         
@@ -406,9 +401,9 @@ class UnsupervisedDiffusionProcess:
     
     def __init__(self, 
                  num_timesteps: int = 1000,
-                 beta_schedule: str = "linear",
+                 beta_schedule: str = "cosine", # 默认使用cosine
                  beta_start: float = 0.0001,
-                 beta_end: float = 0.002,  # 降低最大噪声
+                 beta_end: float = 0.02, # 在timesteps=1000时使用0.02
                  device: str = "cuda"):
         self.num_timesteps = num_timesteps
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -416,47 +411,39 @@ class UnsupervisedDiffusionProcess:
         # 创建beta调度
         if beta_schedule == "cosine":
             self.betas = self._cosine_beta_schedule(num_timesteps).to(self.device)
-        else:
+        else: # linear
             self.betas = self._linear_beta_schedule(num_timesteps, beta_start, beta_end).to(self.device)
         
         # 预计算alpha值
-        self.alphas = (1 - self.betas).to(self.device)
+        self.alphas = (1.0 - self.betas).to(self.device)
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0).to(self.device)
         self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0).to(self.device)
         
         # 预计算采样所需的系数
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod).to(self.device)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - self.alphas_cumprod).to(self.device)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod).to(self.device)
         self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas).to(self.device)
-    
+        self.posterior_variance = self.betas * (1. - self.alphas_cumprod_prev) / (1. - self.alphas_cumprod)
+
     def _linear_beta_schedule(self, timesteps: int, beta_start: float, beta_end: float) -> torch.Tensor:
-        beta_start = 0.0001
-        beta_end = 0.002
-        return torch.linspace(beta_start, beta_end, timesteps)
-    
-    def _cosine_beta_schedule(self, timesteps: int) -> torch.Tensor:
-        s = 0.008
+        return torch.linspace(beta_start**0.5, beta_end**0.5, timesteps, dtype=torch.float32)**2
+
+    def _cosine_beta_schedule(self, timesteps: int, s: float = 0.008) -> torch.Tensor:
         steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
+        x = torch.linspace(0, timesteps, steps, dtype=torch.float32)
         alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.002)  # 限制最大值
+        return torch.clip(betas, 0.0001, 0.9999)
     
     def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, 
                  noise: Optional[torch.Tensor] = None) -> torch.Tensor:
         """前向扩散过程"""
         if noise is None:
-            noise = torch.randn_like(x_start) * 0.5  # 减小噪声
+            noise = torch.randn_like(x_start)
         
-        device = x_start.device
-        t = t.to(device)
-        
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].to(device)
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].to(device)
-        
-        sqrt_alphas_cumprod_t = sqrt_alphas_cumprod_t[:, None, None]
-        sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod_t[:, None, None]
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].view(x_start.shape[0], 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(x_start.shape[0], 1, 1)
         
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
     
@@ -466,132 +453,64 @@ class UnsupervisedDiffusionProcess:
                  content_condition: Optional[torch.Tensor] = None,
                  clip_denoised: bool = True) -> torch.Tensor:
         """
-        反向采样步骤
+        反向采样步骤 (DDPM)
         """
-        device = x.device
-        t = t.to(device)
+        betas_t = self.betas[t].view(x.shape[0], 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(x.shape[0], 1, 1)
+        sqrt_recip_alphas_t = self.sqrt_recip_alphas[t].view(x.shape[0], 1, 1)
         
         # 预测噪声
         predicted_noise = model(x, t, style_condition, content_condition)
         
-        # 获取系数
-        betas_t = self.betas[t].to(device)[:, None, None]
-        sqrt_recip_alphas_t = self.sqrt_recip_alphas[t].to(device)[:, None, None]
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].to(device)[:, None, None]
+        # 计算均值
+        model_mean = sqrt_recip_alphas_t * (x - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t)
         
-        # 预测x0
-        pred_x0 = sqrt_recip_alphas_t * (x - betas_t / sqrt_one_minus_alphas_cumprod_t * predicted_noise)
-        
-        # 裁剪预测值
         if clip_denoised:
-            pred_x0 = torch.clamp(pred_x0, -1.5, 1.5)
+            model_mean = torch.clamp(model_mean, -1.5, 1.5)
+
+        posterior_variance_t = self.posterior_variance[t].view(x.shape[0], 1, 1)
         
-        # 计算均值
-        alphas_cumprod_t = self.alphas_cumprod[t].to(device)[:, None, None]
-        alphas_cumprod_prev_t = self.alphas_cumprod_prev[t].to(device)[:, None, None]
-        
-        # 计算均值
-        mean = (betas_t * torch.sqrt(alphas_cumprod_prev_t) / (1 - alphas_cumprod_t)) * pred_x0 + \
-               ((1 - alphas_cumprod_prev_t) * torch.sqrt(self.alphas[t].to(device)[:, None, None]) / (1 - alphas_cumprod_t)) * x
-        
-        if t[0] > 0:
-            noise = torch.randn_like(x) * 0.5  # 减小噪声
-            posterior_variance_t = betas_t * (1 - alphas_cumprod_prev_t) / (1 - alphas_cumprod_t)
-            return mean + torch.sqrt(posterior_variance_t) * noise
+        if t[0] == 0:
+            return model_mean
         else:
-            return mean
+            noise = torch.randn_like(x)
+            return model_mean + torch.sqrt(posterior_variance_t) * noise
     
     @torch.no_grad()
     def sample(self, model: nn.Module, shape: Tuple[int, ...], 
             style_condition: Optional[torch.Tensor] = None,
             content_condition: Optional[torch.Tensor] = None,
-            num_inference_steps: Optional[int] = None) -> torch.Tensor:
+            num_inference_steps: Optional[int] = 50) -> torch.Tensor:
         """
-        生成采样
+        生成采样 (使用DDIM加速)
         """
         device = next(model.parameters()).device
+        img = torch.randn(shape, device=device)
         
-        # 从纯噪声开始
-        x = torch.randn(shape, device=device)
+        # 设置采样时间步
+        timesteps = torch.linspace(self.num_timesteps - 1, 0, num_inference_steps, dtype=torch.long, device=device)
         
-        if num_inference_steps is None:
-            num_inference_steps = self.num_timesteps
-        
-        # DDIM采样
-        if num_inference_steps < self.num_timesteps:
-            timesteps = torch.linspace(
-                self.num_timesteps - 1, 0, 
-                num_inference_steps, dtype=torch.long, device=device
-            )
+        for i in range(len(timesteps)):
+            t = timesteps[i]
+            prev_t = timesteps[i+1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
             
-            for i in range(len(timesteps) - 1):
-                t = timesteps[i]
-                t_prev = timesteps[i + 1]
-                
-                batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
-                predicted_noise = model(x, batch_t, style_condition, content_condition)
-                
-                # DDIM更新
-                alpha_t = self.alphas_cumprod[t]
-                alpha_t_prev = self.alphas_cumprod[t_prev]
-                
-                x0_pred = (x - torch.sqrt(1 - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
-                # 不要过度限制范围
-                # x0_pred = torch.clamp(x0_pred, -2, 2)  # 注释掉或放宽限制
-                
-                x = torch.sqrt(alpha_t_prev) * x0_pred + \
-                    torch.sqrt(1 - alpha_t_prev) * predicted_noise
-                
-                # x = torch.clamp(x, -3, 3)  # 注释掉或放宽限制
-        else:
-            # 完整DDPM采样
-            for t in reversed(range(self.num_timesteps)):
-                batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
-                x = self.p_sample(model, x, batch_t, style_condition, content_condition)
-        
-        # 最终不要限制范围，让模型自己学习
-        # return torch.clamp(x, -1.5, 1.5)
-        return x
+            batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
+            predicted_noise = model(img, batch_t, style_condition, content_condition)
+            
+            # DDIM 更新
+            alpha_t = self.alphas_cumprod[t]
+            alpha_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else torch.tensor(1.0, device=device)
+            
+            # 预测x0
+            pred_x0 = (img - torch.sqrt(1. - alpha_t) * predicted_noise) / torch.sqrt(alpha_t)
+            
+            # 计算方向导数
+            dir_xt = torch.sqrt(1. - alpha_t_prev) * predicted_noise
+            
+            # 更新x_t -> x_{t-1}
+            img = torch.sqrt(alpha_t_prev) * pred_x0 + dir_xt
 
-class PositionalEncodingWrapper(nn.Module):
-    """为点云添加位置编码"""
-    
-    def __init__(self, model, max_freq=10):
-        super().__init__()
-        self.model = model
-        self.max_freq = max_freq
-    
-    def positional_encoding(self, coords):
-        """添加正弦位置编码"""
-        # coords: [B, N, 3]
-        B, N, _ = coords.shape
-        
-        # 生成频率
-        freqs = 2.0 ** torch.linspace(0, self.max_freq, 16).to(coords.device)
-        
-        # 编码每个维度
-        encoded = []
-        for i in range(3):
-            for freq in freqs:
-                encoded.append(torch.sin(coords[:, :, i:i+1] * freq))
-                encoded.append(torch.cos(coords[:, :, i:i+1] * freq))
-        
-        # 组合所有编码
-        pos_encoding = torch.cat(encoded, dim=-1)  # [B, N, 96]
-        
-        return pos_encoding
-    
-    def forward(self, x, t, style_condition=None, content_condition=None):
-        # 添加位置编码到输入
-        pos_enc = self.positional_encoding(x)
-        
-        # 可以将位置编码加到内容条件中
-        if content_condition is not None:
-            # 简单的方法：将位置信息注入到内容中
-            # 这需要调整内容编码器的输出维度
-            pass
-        
-        return self.model(x, t, style_condition, content_condition)
+        return img
 
 # 测试代码
 if __name__ == "__main__":
@@ -610,7 +529,7 @@ if __name__ == "__main__":
     # 测试数据
     batch_size = 2
     num_points = 2048
-    x = torch.randn(batch_size, num_points, 3).to(device) * 0.5  # 合理的输入范围
+    x = torch.randn(batch_size, num_points, 3).to(device) * 0.5
     t = torch.randint(0, 1000, (batch_size,), device=device)
     
     # 提取风格和内容
@@ -618,14 +537,19 @@ if __name__ == "__main__":
     content = model.content_encoder(x)
     print(f"Style shape: {style.shape}")
     print(f"Content shape: {content.shape}")
-    print(f"Content spatial variance: {content.var(dim=2).mean():.4f}")  # 应该 > 0.01
+    # 检查内容特征的空间方差，修复后应该大于0
+    print(f"Content spatial variance: {content.var(dim=2).mean().item():.6f}")
     
     # 前向传播
     try:
         output = model(x, t)
         print(f"Output shape: {output.shape}")
         print(f"Output range: [{output.min():.3f}, {output.max():.3f}]")
-        print("✓ Model test passed!")
+        # 检查梯度
+        loss = output.mean()
+        loss.backward()
+        print("✓ Gradient check passed!")
+        print("✓ Model forward test passed!")
     except Exception as e:
         print(f"✗ Error: {e}")
         import traceback

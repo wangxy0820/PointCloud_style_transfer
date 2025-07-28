@@ -1,12 +1,11 @@
 # models/__init__.py
 
 from .diffusion_model import PointCloudDiffusionModel, DiffusionProcess
-from .unsupervised_diffusion_model import (
+from .diffusion_model_unsupervised import (
     UnsupervisedPointCloudDiffusionModel, 
     UnsupervisedDiffusionProcess,
     StyleEncoder,
-    ContentEncoder,
-    PositionalEncodingWrapper
+    ContentEncoder
 )
 from .pointnet2_encoder import ImprovedPointNet2Encoder
 from .chunk_fusion import ImprovedChunkFusion

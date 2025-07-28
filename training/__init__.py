@@ -1,29 +1,17 @@
 # 导入训练相关模块
-try:
-    from .trainer import DiffusionTrainer, ExponentialMovingAverage
-except ImportError:
-    # 如果原始trainer不存在或有问题，创建一个简单版本
-    pass
+#from .trainer import DiffusionTrainer, ExponentialMovingAverage
 
-try:
-    from .unsupervised_trainer import UnsupervisedDiffusionTrainer
-except ImportError:
-    pass
+from .trainer_unsupervised import UnsupervisedDiffusionTrainer
 
-try:
-    from .progressive_trainer import ProgressiveDiffusionTrainer
-except ImportError:
-    pass
+#from .progressive_trainer import ProgressiveDiffusionTrainer
 
-try:
-    from .validator import Validator
-except ImportError:
-    pass
+from .validator import Validator
+
 
 __all__ = [
-    'DiffusionTrainer',
+    #'DiffusionTrainer',
     'UnsupervisedDiffusionTrainer', 
-    'ProgressiveDiffusionTrainer',
-    'ExponentialMovingAverage',
+    #'ProgressiveDiffusionTrainer',
+    #'ExponentialMovingAverage',
     'Validator'
 ]
