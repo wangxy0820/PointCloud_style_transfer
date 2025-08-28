@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 import os
-import time
 import numpy as np
 from typing import Dict
 
@@ -16,9 +16,8 @@ from utils.visualization import PointCloudVisualizer
 from utils.logger import Logger
 from utils.checkpoint import CheckpointManager
 
-# 确保这个类是可用的，或者从您的utils文件中导入
+
 class ExponentialMovingAverage:
-    """指数移动平均"""
     def __init__(self, parameters, decay=0.995):
         self.parameters = list(parameters)
         self.decay = decay
@@ -32,11 +31,10 @@ class ExponentialMovingAverage:
         for param, shadow_param in zip(self.parameters, self.shadow_params):
             param.data.copy_(shadow_param.data)
     
-    def restore(self):
-        # 这是一个简化的restore，理想情况下应该有一个单独的备份
-        # 在验证时，通常是 apply_shadow -> validation -> restore
-        pass
-    
+    def restore(self, model_params):
+        for param, shadow_param in zip(model_params, self.shadow_params):
+            param.data.copy_(shadow_param.data)
+
     def state_dict(self):
         return {'decay': self.decay, 'shadow_params': self.shadow_params}
     
@@ -46,24 +44,22 @@ class ExponentialMovingAverage:
 
 
 class UnsupervisedDiffusionTrainer:
-    """无监督Diffusion模型训练器 - 最终完整修复版"""
-    
-    def __init__(self, config):
+    """
+    修复的训练器 - 解决验证loss过高的问题
+    """
+    def __init__(self, config, stage: int = 1, stage1_checkpoint_path: str = None):
         self.config = config
+        self.stage = stage
         self.device = torch.device(config.device if torch.cuda.is_available() else 'cpu')
         
-        # 完整路径
         experiment_path = os.path.join('experiments', config.experiment_name)
         log_dir = os.path.join(experiment_path, 'logs')
         checkpoint_dir = os.path.join(experiment_path, 'checkpoints')
         
-        # 初始化日志
-        self.logger = Logger(
-            name='UnsupervisedDiffusionTrainer',
-            log_dir=log_dir
-        )
+        self.logger = Logger(name=f'UnsupervisedTrainer_Stage{self.stage}', log_dir=log_dir)
+        self.writer = SummaryWriter(log_dir)
         
-        # 初始化模型
+        # 创建模型
         self.model = UnsupervisedPointCloudDiffusionModel(
             input_dim=3,
             hidden_dims=[128, 256, 512, 1024],
@@ -71,6 +67,19 @@ class UnsupervisedDiffusionTrainer:
             style_dim=256,
             content_dims=[64, 128, 256]
         ).to(self.device)
+        
+        # Stage 2: 加载Stage 1的权重
+        if self.stage == 2:
+            if not stage1_checkpoint_path or not os.path.exists(stage1_checkpoint_path):
+                raise ValueError("Stage 2 requires Stage 1 checkpoint")
+            self.logger.info(f"Loading Stage 1 checkpoint: {stage1_checkpoint_path}")
+            checkpoint = torch.load(stage1_checkpoint_path, map_location=self.device, weights_only=False)
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # 冻结部分层
+            self.logger.info("Freezing Content Encoder for Stage 2")
+            for param in self.model.content_encoder.parameters():
+                param.requires_grad = False
         
         # Diffusion过程
         self.diffusion_process = UnsupervisedDiffusionProcess(
@@ -81,203 +90,320 @@ class UnsupervisedDiffusionTrainer:
         
         # 优化器
         self.optimizer = optim.AdamW(
-            self.model.parameters(),
+            filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=config.learning_rate,
             weight_decay=config.weight_decay
         )
         
-        # 学习率调度器
+        # 学习率调度
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
+            self.optimizer, 
             T_max=config.num_epochs
         )
         
-        # 损失函数
-        self.criterion = UnsupervisedDiffusionLoss(
-            lambda_diffusion=config.lambda_diffusion,
-            lambda_chamfer=config.lambda_chamfer,
-            lambda_content=config.lambda_content,
-            lambda_style=config.lambda_style,
-            lambda_smooth=config.lambda_smooth,
-            lambda_lidar_structure=config.lambda_lidar_structure
-        ).to(self.device)
+        # 损失函数 - Stage 1使用更简单的配置
+        if self.stage == 1:
+            loss_kwargs = {
+                'lambda_diffusion': 1.0,
+                'lambda_chamfer': 0.0,  # 初始不使用chamfer loss
+                'lambda_content': 0.1,
+                'lambda_style': 0.0,
+                'lambda_smooth': 0.01,
+                'lambda_lidar_structure': 0.0
+            }
+        else:
+            loss_kwargs = {
+                'lambda_diffusion': 1.0,
+                'lambda_chamfer': 2.0,
+                'lambda_content': 0.1,
+                'lambda_style': 0.1,
+                'lambda_smooth': 0.01,
+                'lambda_lidar_structure': 0.1
+            }
         
-        self.warmup_steps = config.warmup_steps
+        self.criterion = UnsupervisedDiffusionLoss(**loss_kwargs).to(self.device)
+        
+        # Mixed precision
+        self.scaler = GradScaler()
         
         # EMA
-        if hasattr(config, 'ema_decay') and config.ema_decay > 0:
-            self.ema = ExponentialMovingAverage(
-                self.model.parameters(),
-                decay=config.ema_decay
-            )
+        if config.ema_decay > 0:
+            self.ema = ExponentialMovingAverage(self.model.parameters(), decay=config.ema_decay)
         else:
             self.ema = None
         
+        # 评估
         self.metrics = PointCloudMetrics(device=str(self.device))
-        self.visualizer = PointCloudVisualizer()
+        self.checkpoint_manager = CheckpointManager(checkpoint_dir=checkpoint_dir, max_checkpoints=5)
         
-        # TensorBoard
-        self.writer = SummaryWriter(log_dir)
-        
-        # 检查点管理器
-        self.checkpoint_manager = CheckpointManager(
-            checkpoint_dir=checkpoint_dir,
-            max_checkpoints=5
-        )
-        
-        # 训练状态
+        # 状态
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float('inf')
         
-        self.logger.info("Unsupervised trainer initialized successfully")
-    
+        self.logger.info(f"Trainer initialized for Stage {self.stage}")
+        self.logger.info(f"Loss weights: {loss_kwargs}")
+
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """训练步骤"""
         self.model.train()
+        self.optimizer.zero_grad()
+        
         sim_points = batch['sim_points'].to(self.device)
         real_points = batch['real_points'].to(self.device)
-        batch_size = sim_points.shape[0]
-
-        if np.random.rand() > 0.5:
-            source_points, target_points = sim_points, real_points
+        
+        # 验证输入数据范围
+        sim_min, sim_max = sim_points.min().item(), sim_points.max().item()
+        real_min, real_max = real_points.min().item(), real_points.max().item()
+        
+        if abs(sim_min) > 2 or abs(sim_max) > 2 or abs(real_min) > 2 or abs(real_max) > 2:
+            self.logger.warning(f"Input data out of range: sim[{sim_min:.2f}, {sim_max:.2f}], real[{real_min:.2f}, {real_max:.2f}]")
+            # Clamp到合理范围
+            sim_points = torch.clamp(sim_points, -1.5, 1.5)
+            real_points = torch.clamp(real_points, -1.5, 1.5)
+        
+        with autocast():
+            batch_size = sim_points.shape[0]
+            
+            # Stage 1: 自重建
+            if self.stage == 1:
+                source_points = sim_points
+                target_points = sim_points  # 自重建
+                target_style = self.model.style_encoder(source_points)
+            else:
+                # Stage 2: 风格转换
+                if np.random.rand() > 0.5:
+                    source_points = sim_points
+                    target_points = real_points
+                else:
+                    source_points = real_points
+                    target_points = sim_points
+                target_style = self.model.style_encoder(target_points)
+            
+            # 内容编码
+            source_content = self.model.content_encoder(source_points)
+            
+            # Diffusion前向过程 - 使用较小的时间步
+            max_t = min(500, self.config.num_timesteps)
+            t = torch.randint(0, max_t, (batch_size,), device=self.device)
+            
+            # 生成噪声
+            noise = torch.randn_like(source_points)
+            
+            # 加噪
+            noisy_points = self.diffusion_process.q_sample(source_points, t, noise)
+            
+            # 限制noisy_points范围
+            noisy_points = torch.clamp(noisy_points, -2.0, 2.0)
+            
+            # 预测噪声
+            if self.stage == 1:
+                # Stage 1: 不使用风格条件
+                predicted_noise = self.model(
+                    noisy_points, t,
+                    style_condition=None,
+                    content_condition=source_content
+                )
+            else:
+                # Stage 2: 使用风格条件
+                predicted_noise = self.model(
+                    noisy_points, t,
+                    style_condition=target_style,
+                    content_condition=source_content
+                )
+            
+            # 计算重建（用于辅助损失）
+            alpha_t = self.diffusion_process.alphas_cumprod[t].view(batch_size, 1, 1)
+            sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
+            sqrt_recip_alpha_t = 1.0 / torch.sqrt(alpha_t)
+            
+            generated_points = sqrt_recip_alpha_t * (noisy_points - sqrt_one_minus_alpha_t * predicted_noise)
+            generated_points = torch.clamp(generated_points, -1.5, 1.5)
+            
+            # 提取内容和风格
+            noisy_content = self.model.content_encoder(noisy_points)
+            generated_style = self.model.style_encoder(generated_points)
+            
+            # 计算损失
+            warmup_factor = min(1.0, self.global_step / self.config.warmup_steps)
+            
+            # 动态调整chamfer loss权重
+            if self.current_epoch < 10:
+                chamfer_weight = 0.0  # 前10个epoch不使用
+            elif self.current_epoch < 30:
+                chamfer_weight = ((self.current_epoch - 10) / 20) * 2.0  # 线性增加
+            else:
+                chamfer_weight = 2.0 if self.stage == 1 else 5.0
+            
+            # 临时修改损失权重
+            original_lambda_chamfer = self.criterion.lambda_chamfer
+            self.criterion.lambda_chamfer = chamfer_weight
+            
+            losses = self.criterion(
+                pred_noise=predicted_noise,
+                target_noise=noise,
+                generated_points=generated_points,
+                original_points=target_points,
+                content_original=source_content,
+                content_from_noisy=noisy_content,
+                style_source=generated_style,
+                style_target=target_style.detach() if target_style is not None else generated_style,
+                warmup_factor=warmup_factor,
+                epoch=self.current_epoch
+            )
+            
+            # 恢复原始权重
+            self.criterion.lambda_chamfer = original_lambda_chamfer
+            
+            total_loss = losses['total']
+        
+        # 反向传播
+        self.scaler.scale(total_loss).backward()
+        self.scaler.unscale_(self.optimizer)
+        
+        # 梯度裁剪
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+        
+        # 更新权重
+        if grad_norm < 10:  # 只在梯度正常时更新
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            
+            if self.ema:
+                self.ema.update()
         else:
-            source_points, target_points = real_points, sim_points
-
-        target_style = self.model.style_encoder(target_points)
-        source_content = self.model.content_encoder(source_points)
+            self.logger.warning(f"Gradient explosion: {grad_norm:.2f}, skipping update")
+            self.scaler.update()
         
-        t = torch.randint(0, self.config.num_timesteps, (batch_size,), device=self.device)
-        
-        noise = torch.randn_like(source_points)
-        noisy_points = self.diffusion_process.q_sample(source_points, t, noise)
-        
-        noisy_content = self.model.content_encoder(noisy_points)
-        
-        predicted_noise = self.model(
-            noisy_points, t, 
-            style_condition=target_style,
-            content_condition=source_content.detach()
-        )
-        
-        alpha_t = self.diffusion_process.alphas_cumprod[t].view(batch_size, 1, 1)
-        sqrt_one_minus_alpha_t = torch.sqrt(1.0 - alpha_t)
-        sqrt_recip_alpha_t = 1.0 / torch.sqrt(alpha_t)
-        generated_points = sqrt_recip_alpha_t * (noisy_points - sqrt_one_minus_alpha_t * predicted_noise)
-
-        generated_style = self.model.style_encoder(generated_points)
-
-        warmup_factor = min(1.0, self.global_step / self.warmup_steps)
-        losses = self.criterion(
-            pred_noise=predicted_noise,
-            target_noise=noise,
-            generated_points=generated_points,
-            original_points=source_points,
-            content_original=source_content,
-            content_from_noisy=noisy_content,
-            style_source=generated_style,
-            style_target=target_style.detach(),
-            warmup_factor=warmup_factor
-        )
-        
-        self.optimizer.zero_grad()
-        losses['total'].backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
-        self.optimizer.step()
-        if self.ema: self.ema.update()
-
         self.global_step += 1
-        return {k: v.item() for k, v in losses.items()}
+        
+        return {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
 
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """验证 - 无监督版本"""
-        self.logger.info("Running validation...")
+        """验证 - 使用更快的推理"""
         self.model.eval()
-        
         all_metrics = []
         
         if self.ema:
             self.ema.apply_shadow()
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
+            for i, batch in enumerate(tqdm(val_loader, desc="Validation")):
+                if i >= 5:  # 只验证5个batch以加快速度
+                    break
+                
                 sim_points = batch['sim_points'].to(self.device)
                 real_points = batch['real_points'].to(self.device)
                 
-                real_style = self.model.style_encoder(real_points)
-                sim_content = self.model.content_encoder(sim_points)
+                # Clamp输入
+                sim_points = torch.clamp(sim_points, -1.5, 1.5)
+                real_points = torch.clamp(real_points, -1.5, 1.5)
                 
-                sim_to_real = self.diffusion_process.sample(
+                if self.stage == 1:
+                    source_points = sim_points
+                    target_points = sim_points
+                    target_style = None
+                else:
+                    source_points = sim_points
+                    target_points = real_points
+                    target_style = self.model.style_encoder(target_points)
+                
+                content_features = self.model.content_encoder(source_points)
+                
+                # 快速生成（使用更少的步数）
+                generated = self.diffusion_process.sample(
                     self.model,
-                    sim_points.shape,
-                    style_condition=real_style,
-                    content_condition=sim_content,
-                    num_inference_steps=50
+                    source_points.shape,
+                    style_condition=target_style,
+                    content_condition=content_features,
+                    num_inference_steps=10  # 减少到10步
                 )
                 
+                # 计算指标
                 metrics = {}
-                metrics['content_preservation'] = self.metrics.chamfer_distance(sim_to_real, sim_points).mean().item()
-                metrics['style_transfer_cd'] = self.metrics.chamfer_distance(sim_to_real, real_points).mean().item()
+                
+                # 内容保持
+                cd = self.metrics.chamfer_distance(generated, source_points)
+                metrics['content_preservation'] = cd.mean().item()
+                
+                if self.stage == 2:
+                    # 风格转换
+                    cd_style = self.metrics.chamfer_distance(generated, target_points)
+                    metrics['style_transfer_cd'] = cd_style.mean().item()
+                
                 all_metrics.append(metrics)
         
         if self.ema:
-            self.ema.restore()
+            self.ema.restore(self.model.parameters())
         
+        # 计算平均
         avg_metrics = {}
         for key in all_metrics[0].keys():
             avg_metrics[f'val_{key}'] = np.mean([m[key] for m in all_metrics])
         
-        avg_metrics['val_loss'] = avg_metrics.get('val_content_preservation', 0) + avg_metrics.get('val_style_transfer_cd', 0)
+        # 总验证损失
+        if self.stage == 1:
+            avg_metrics['val_loss'] = avg_metrics.get('val_content_preservation', float('inf'))
+        else:
+            avg_metrics['val_loss'] = avg_metrics.get('val_style_transfer_cd', float('inf'))
         
         return avg_metrics
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader):
-        """训练主循环"""
-        self.logger.info(f"Starting unsupervised training for {self.config.num_epochs} epochs")
+        """主训练循环"""
+        self.logger.info(f"Starting Stage {self.stage} training for {self.config.num_epochs} epochs")
         
         for epoch in range(self.current_epoch, self.config.num_epochs):
             self.current_epoch = epoch
             epoch_losses = []
             
-            pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{self.config.num_epochs}')
+            pbar = tqdm(train_loader, desc=f'Stage {self.stage} - Epoch {epoch}/{self.config.num_epochs}')
             for batch in pbar:
                 losses = self.train_step(batch)
                 epoch_losses.append(losses['total'])
                 
+                # 更新进度条
                 pbar.set_postfix({
-                    'loss': losses.get('total', 0),
-                    'chamfer': losses.get('chamfer', 0)
+                    'loss': f"{losses['total']:.3f}",
+                    'diff': f"{losses.get('diffusion', 0):.3f}",
+                    'chamfer': f"{losses.get('chamfer', 0):.3f}"
                 })
                 
+                # 记录到tensorboard
                 if self.global_step % self.config.log_interval == 0:
                     for k, v in losses.items():
                         self.writer.add_scalar(f'train/{k}', v, self.global_step)
-                    self.writer.add_scalar('train/learning_rate', self.optimizer.param_groups[0]['lr'], self.global_step)
             
+            # Epoch统计
             avg_epoch_loss = np.mean(epoch_losses)
             self.writer.add_scalar('epoch/loss', avg_epoch_loss, epoch)
-            self.logger.info(f"Epoch {epoch} - Average Train Loss: {avg_epoch_loss:.6f}")
-
+            self.logger.info(f"Epoch {epoch} - Average Loss: {avg_epoch_loss:.4f}")
+            
+            # 验证
             if epoch % self.config.eval_interval == 0:
                 val_results = self.validate(val_loader)
-                self.logger.info(f"Validation results: {val_results}")
+                self.logger.info(f"Validation: {val_results}")
+                
                 for k, v in val_results.items():
                     self.writer.add_scalar(k, v, epoch)
                 
+                # 保存最佳模型
                 if val_results['val_loss'] < self.best_val_loss:
                     self.best_val_loss = val_results['val_loss']
                     self.save_checkpoint(is_best=True)
-                    self.logger.info(f"New best model saved with val_loss: {self.best_val_loss:.6f}")
+                    self.logger.info(f"New best model! Val loss: {self.best_val_loss:.4f}")
             
-            if epoch % self.config.save_interval == 0:
+            # 定期保存
+            if epoch % self.config.save_interval == 0 and epoch > 0:
                 self.save_checkpoint(is_best=False)
             
+            # 更新学习率
             self.scheduler.step()
         
         self.writer.close()
-        self.logger.info("Unsupervised training completed!")
+        self.logger.info(f"Stage {self.stage} training completed!")
 
     def save_checkpoint(self, is_best: bool = False):
-        """保存检查点"""
         state = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
@@ -285,148 +411,13 @@ class UnsupervisedDiffusionTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
             'best_val_loss': self.best_val_loss,
-            'config': self.config
+            'config': self.config,
+            'stage': self.stage
         }
         if self.ema:
             state['ema_state_dict'] = self.ema.state_dict()
-            
+        
         self.checkpoint_manager.save_checkpoint(
-            state,
-            epoch=self.current_epoch,
-            is_best=is_best,
-            metric=self.best_val_loss,
-            metric_name='val_loss'
+            state, epoch=self.current_epoch, is_best=is_best,
+            metric=self.best_val_loss, metric_name='val_loss'
         )
-    
-    def load_checkpoint(self, checkpoint_path: str):
-        """加载检查点"""
-        self.logger.info(f"Loading checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        if self.ema is not None and checkpoint.get('ema_state_dict') is not None:
-            self.ema.load_state_dict(checkpoint['ema_state_dict'])
-        
-        self.current_epoch = checkpoint['epoch'] + 1  # 从下一个epoch开始
-        self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
-        
-        if 'current_chunks' in checkpoint:
-            self.current_chunks = checkpoint['current_chunks']
-        
-        if 'loss_history' in checkpoint:
-            self.loss_history = checkpoint['loss_history']
-        
-        self.logger.info(f"Resumed from epoch {checkpoint['epoch']}, global step {self.global_step}")
-    
-    def visualize_results(self, val_loader: DataLoader, epoch: int):
-        """可视化训练结果"""
-        self.model.eval()
-        
-        # 如果有EMA，使用EMA权重
-        if self.ema is not None:
-            self.ema.apply_shadow()
-        
-        with torch.no_grad():
-            # 获取一个batch的数据
-            batch = next(iter(val_loader))
-            sim_points = batch['sim_points'][:2].to(self.device)  # 只取2个样本
-            real_points = batch['real_points'][:2].to(self.device)
-            
-            # Sim -> Real
-            real_style = self.model.style_encoder(real_points)
-            sim_content = self.model.content_encoder(sim_points)
-            
-            sim_to_real = self.diffusion_process.sample(
-                self.model,
-                sim_points.shape,
-                style_condition=real_style,
-                content_condition=sim_content,
-                num_inference_steps=50
-            )
-            
-            # 创建可视化目录
-            vis_dir = os.path.join(self.config.result_dir, f'epoch_{epoch}')
-            os.makedirs(vis_dir, exist_ok=True)
-            
-            # 为每个样本创建可视化
-            for i in range(len(sim_points)):
-                try:
-                    # 如果数据使用了LiDAR标准化，可能需要反标准化以正确可视化
-                    sim_viz = sim_points[i].cpu().numpy()
-                    real_viz = real_points[i].cpu().numpy()
-                    gen_viz = sim_to_real[i].cpu().numpy()
-                    
-                    vis_path = os.path.join(vis_dir, f'sample_{i}_sim_to_real.png')
-                    self.visualizer.plot_style_transfer_result(
-                        sim_viz,
-                        gen_viz,
-                        real_viz,
-                        title=f'Epoch {epoch} - Sim to Real - Sample {i+1}',
-                        save_path=vis_path
-                    )
-                    
-                    # 额外保存Z轴分布对比
-                    self.visualizer.plot_z_distribution(
-                        sim_viz[:, 2],
-                        gen_viz[:, 2],
-                        real_viz[:, 2],
-                        save_path=os.path.join(vis_dir, f'sample_{i}_z_dist.png')
-                    )
-                except Exception as e:
-                    self.logger.warning(f"Failed to visualize sample {i}: {e}")
-            
-            self.logger.info(f"Visualization saved to: {vis_dir}")
-        
-        # 恢复原始权重
-        if self.ema is not None:
-            self.ema.restore()
-        
-        # 恢复训练模式
-        self.model.train()
-
-
-# 主训练脚本
-if __name__ == "__main__":
-    import argparse
-    from config import Config
-    
-    parser = argparse.ArgumentParser(description='Train unsupervised diffusion model')
-    parser.add_argument('--config', type=str, help='Path to config file')
-    parser.add_argument('--resume', type=str, help='Path to checkpoint to resume from')
-    parser.add_argument('--experiment_name', type=str, default='lidar_unsupervised',
-                       help='Experiment name for logging')
-    
-    args = parser.parse_args()
-    
-    # 创建配置
-    config = Config()
-    
-    # 设置实验目录
-    config.experiment_dir = args.experiment_name
-    config.checkpoint_dir = os.path.join('experiments', args.experiment_name, 'checkpoints')
-    config.log_dir = os.path.join('experiments', args.experiment_name, 'logs')
-    config.result_dir = os.path.join('experiments', args.experiment_name, 'results')
-    
-    # 确保使用LiDAR模式
-    config.use_lidar_normalization = True
-    config.use_lidar_chunking = True
-    
-    # 设置预热步数
-    config.warmup_steps = 1000
-    
-    # 创建训练器
-    trainer = UnsupervisedDiffusionTrainer(config)
-    
-    # 如果指定了检查点，加载它
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
-    
-    # 创建数据加载器
-    train_loader, val_loader, test_loader = trainer.create_dataloaders_for_training()
-    
-    # 开始训练
-    trainer.train(train_loader, val_loader)

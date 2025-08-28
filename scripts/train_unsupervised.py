@@ -1,188 +1,110 @@
-#!/usr/bin/env python3
-"""
-无监督训练脚本
-"""
-
 import argparse
 import os
 import sys
 import torch
 import numpy as np
 import random
-from datetime import datetime
-import logging
+import traceback # ADDED: 导入traceback模块用于打印详细错误
 
-# 添加项目根目录
+# Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config_unsupervised import ConfigUnsupervised
 from data.dataset import create_dataloaders
 from training.trainer_unsupervised import UnsupervisedDiffusionTrainer
 from utils.logger import Logger
-from utils.checkpoint import CheckpointManager
-
 
 def set_seed(seed: int):
-    """设置随机种子"""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Unsupervised Point Cloud Style Transfer')
+    parser = argparse.ArgumentParser(description='Two-Stage Unsupervised Point Cloud Style Transfer')
     
-    # 必需参数
-    parser.add_argument('--data_dir', type=str, default='None', help='Preprocessed data directory')
-    
-    # 实验配置
-    parser.add_argument('--experiment_name', type=str, default='None')
-    parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    
-    # 训练参数
-    parser.add_argument('--batch_size', type=int, default=None)
-    parser.add_argument('--num_epochs', type=int, default=None)
-    parser.add_argument('--learning_rate', type=float, default=None)
-    
-    # 设备配置
-    parser.add_argument('--device', type=str, default='cuda')
-    parser.add_argument('--num_workers', type=int, default=4)
-    
-    # 其他选项
-    parser.add_argument('--use_ema', action='store_true', help='Use exponential moving average')
-    parser.add_argument('--gradient_clip', type=float, default=1.0)
-    parser.add_argument('--save_interval', type=int, default=10)
-    parser.add_argument('--log_interval', type=int, default=50)
-    parser.add_argument('--eval_interval', type=int, default=2)
+    parser.add_argument('--experiment_name', type=str, default=None, help='Name for the experiment directory.')
+    parser.add_argument('--stage', type=int, default=1, choices=[1, 2], help='Training stage: 1 for reconstruction, 2 for style transfer.')
+    parser.add_argument('--stage1_checkpoint', type=str, default=None, help='Path to the best model from stage 1, required for stage 2.')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed.')
+    parser.add_argument('--device', type=str, default='cuda', help='Device to use.')
     
     args = parser.parse_args()
     
-    # 设置随机种子
     set_seed(args.seed)
     
-    # 创建配置
     config = ConfigUnsupervised()
-    
-    # 覆盖配置参数
-    if args.batch_size is not None:
-        config.batch_size = args.batch_size
-    if args.num_epochs is not None:
-        config.num_epochs = args.num_epochs
-    if args.learning_rate is not None:
-        config.learning_rate = args.learning_rate
-    
-    # 设置其他参数
+    #config.experiment_name = args.experiment_name
     config.device = args.device
-    config.num_workers = args.num_workers
-    config.gradient_clip = args.gradient_clip
-    config.save_interval = args.save_interval
-    config.log_interval = args.log_interval
-    config.eval_interval = args.eval_interval
     
-    
-    # 如果使用EMA
-    if args.use_ema:
-        config.ema_decay = 0.995
+    if args.stage == 2:
+        print("--- CONFIGURING FOR STAGE 2: STYLE TRANSFER FINETUNING ---")
+        config.learning_rate = 1e-5
+        config.lambda_chamfer = 5.0
+        config.lambda_style = 0.05
+        config.lambda_content = 0.0
+        if not args.stage1_checkpoint:
+            raise ValueError("--stage1_checkpoint is required for stage 2 training.")
     else:
-        config.ema_decay = 0
+        print("--- CONFIGURING FOR STAGE 1: GEOMETRIC RECONSTRUCTION ---")
+
+    experiment_dir = os.path.join('experiments', config.experiment_name)
+    log_dir = os.path.join(experiment_dir, 'logs')
+    config.checkpoint_dir = os.path.join(experiment_dir, 'checkpoints')
+    config.log_dir = log_dir
+    config.result_dir = os.path.join(experiment_dir, 'results')
     
-    # 更新路径
-    experiment_name = os.path.join('experiments', config.experiment_name)
-    config.checkpoint_dir = os.path.join(experiment_name, 'checkpoints')
-    config.log_dir = os.path.join(experiment_name, 'logs')
-    config.result_dir = os.path.join(experiment_name, 'results')
-    
-    # 创建目录
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     os.makedirs(config.log_dir, exist_ok=True)
-    os.makedirs(config.result_dir, exist_ok=True)
     
-    # 初始化日志
-    logger = Logger(
-        name='unsupervised_training',
-        log_dir=config.log_dir,
-        log_level='INFO'
-    )
+    logger = Logger(name='train_script', log_dir=log_dir, log_level='INFO')
     
-    logger.info(f"Starting unsupervised experiment: {args.experiment_name}")
-    logger.info(f"Configuration: {config.__dict__}")
+    logger.info(f"Starting experiment: {config.experiment_name}")
+    logger.info(f"Selected Stage: {args.stage}")
+    logger.info(f"Full Configuration: {config}")
     
-    # 保存配置
-    import json
-    config_path = os.path.join(experiment_name, 'config.json')
-    with open(config_path, 'w') as f:
-        json.dump(config.__dict__, f, indent=2)
-    
-    # 创建数据加载器
     logger.info("Creating data loaders...")
     try:
-        train_loader, val_loader, test_loader = create_dataloaders(
+        train_loader, val_loader, _ = create_dataloaders(
             config.processed_data_dir,
             config.batch_size,
             config.num_workers,
-            config.chunk_size
+            config.chunk_size,
+            config=config
         )
-        
-        logger.info(f"Train batches: {len(train_loader)}")
-        logger.info(f"Val batches: {len(val_loader)}")
-        logger.info(f"Test batches: {len(test_loader)}")
-        
+        logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
     except Exception as e:
+        # CHANGED: 修改了错误记录方式以兼容您的Logger
         logger.error(f"Failed to create data loaders: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return
-    
-    # 创建训练器
+        
     logger.info("Creating unsupervised trainer...")
     try:
-        trainer = UnsupervisedDiffusionTrainer(config)
-        
+        trainer = UnsupervisedDiffusionTrainer(
+            config=config,
+            stage=args.stage,
+            stage1_checkpoint_path=args.stage1_checkpoint
+        )
     except Exception as e:
+        # CHANGED: 修改了错误记录方式
         logger.error(f"Failed to create trainer: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         return
-    
-    # 恢复训练
-    if args.resume:
-        logger.info(f"Resuming from {args.resume}")
-        try:
-            checkpoint = torch.load(args.resume, map_location=config.device, weights_only=False)
-            trainer.model.load_state_dict(checkpoint['model_state_dict'])
-            trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            trainer.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            if 'ema_state_dict' in checkpoint and args.use_ema:
-                trainer.ema.load_state_dict(checkpoint['ema_state_dict'])
-            trainer.current_epoch = checkpoint['epoch'] + 1
-            trainer.best_val_loss = checkpoint['best_val_loss']
-            logger.info(f"Resumed from epoch {trainer.current_epoch}")
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
-            return
-    
-    # 开始训练
-    logger.info("Starting unsupervised training...")
-    logger.info("Note: This model does NOT require point-to-point correspondence!")
-    logger.info("The model will learn to transfer style while preserving geometry.")
-    
+        
+    logger.info(f"Starting Stage {args.stage} training...")
     try:
         trainer.train(train_loader, val_loader)
         logger.info("Training completed successfully!")
-        
     except KeyboardInterrupt:
-        logger.info("Training interrupted by user")
-        # 保存中断时的检查点
+        logger.info("Training interrupted by user. Saving checkpoint...")
         trainer.save_checkpoint(is_best=False)
-        logger.info("Checkpoint saved")
-        
+        logger.info("Checkpoint saved.")
     except Exception as e:
+        # CHANGED: 修改了错误记录方式
         logger.error(f"Training failed: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise
-    
-    logger.info(f"Experiment completed. Results saved to: {experiment_name}")
-
 
 if __name__ == "__main__":
     main()

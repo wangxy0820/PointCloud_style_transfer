@@ -1,86 +1,90 @@
+from dataclasses import dataclass, field
 import os
-from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Tuple
 
 
 @dataclass
 class ConfigUnsupervised:
-    """无监督模型的专属配置"""
+    """
+    无监督模型的专属配置。
+    通过修改此文件中的参数来控制两阶段的训练。
+    """
     
     # --- 实验与路径 ---
-    experiment_name: str = "test2"
+    experiment_name: str = "test1"
     data_root: str = "datasets"
     processed_data_dir: str = os.path.join(data_root, "processed")
-    sim_data_dir: str = "datasets/simulation"
-    real_data_dir: str = "datasets/real_world"
     
-    # 点云参数 - 修改以支持更大的chunk
-    total_points: int = 120000    # 完整点云点数
-    chunk_size: int = 4096        # 增大到4096（可选：2048, 4096, 8192, 16384）
-    overlap_ratio: float = 0.2    # 减小重叠率以适应更大的chunk
+    # --- 数据与分块 ---
+    total_points: int = 120000
+    chunk_size: int = 4096
+    overlap_ratio: float = 0.2
     
-    # LiDAR特定配置
-    use_lidar_normalization: bool = True  # 使用LiDAR友好的标准化
-    use_lidar_chunking: bool = True       # 使用LiDAR感知的分块策略
+    # --- LiDAR特定配置 ---
+    use_lidar_normalization: bool = True
+    use_lidar_chunking: bool = True
     
-     # --- 模型参数 ---
+    # --- 模型参数 ---
     time_embed_dim: int = 256
-    num_timesteps: int = 1000  # CHANGED: 增加步数以获得更稳定的训练
-    beta_schedule: str = "cosine" # CHANGED: 余弦调度通常效果更好
-        
+    num_timesteps: int = 1000
+    beta_schedule: str = "cosine"
+    
     # --- 训练参数 ---
-    num_epochs: int = 100 # 建议增加训练轮数
-    learning_rate: float = 3e-5
+    num_epochs: int = 60 # 为每个阶段提供足够的训练轮数
     weight_decay: float = 1e-4
     ema_decay: float = 0.995
     gradient_clip: float = 1.0
-    warmup_steps: int = 1000
+    warmup_steps: int = 500 # 减少预热步骤
     
     # --- 自动批处理大小 ---
     _batch_size: int = None
     @property
     def batch_size(self) -> int:
-        if self._batch_size is not None:
-            return self._batch_size
-        # 根据chunk_size自动计算
-        if self.chunk_size <= 2048: return 8
-        if self.chunk_size <= 4096: return 4
-        if self.chunk_size <= 8192: return 2
+        if self._batch_size is not None: return self._batch_size
+        if self.chunk_size <= 2048: return 16
+        if self.chunk_size <= 4096: return 8
+        if self.chunk_size <= 8192: return 4
         return 1
     
-    # 训练参数 - 使用自动batch_size
     @batch_size.setter
     def batch_size(self, value: int):
         self._batch_size = value
 
+    # --- 学习率 ---
+    # 默认设置为第一阶段
+    #learning_rate: float = 1e-4
+
+    # # --- 损失权重 ---
+    # # 默认设置为第一阶段
+    # lambda_diffusion: float = 1.0
+    # lambda_chamfer: float = 10.0
+    # lambda_content: float = 1.0
+    # lambda_style: float = 0.0  # 在第一阶段完全禁用风格损失
+    # lambda_lidar_structure: float = 1.0
+    # lambda_smooth: float = 0.5
     
-    # --- 渐进式训练 (可选) ---
-    progressive_training: bool = False # 建议先关闭以简化调试
-    initial_chunks: int = 10
-    chunks_increment: int = 10
-    progressive_epochs: int = 20
     
-    # --- 损失权重 (核心修改) ---
+    # 第二阶段
+    learning_rate: float = 1e-5
+    
     lambda_diffusion: float = 1.0
-    lambda_chamfer: float = 1.0          # ADDED: 使用Chamfer Loss作为主要的几何约束
-    lambda_content: float = 2.0          # 内容编码器的一致性
-    lambda_style: float = 0.01           # 风格损失，保持较低
-    lambda_lidar_structure: float = 0.5  # LiDAR结构损失，可以适当提高
-    lambda_smooth: float = 0.5           # 平滑度损失，防止噪点
+    lambda_chamfer: float = 5.0
+    lambda_content: float = 1.0
+    lambda_style: float = 0.05
+    lambda_lidar_structure: float = 1.0
+    lambda_smooth: float = 0.5
     
-    # 数据增强参数 - 针对LiDAR调整
-    augmentation_rotation_range: float = 0.05   # 减小旋转范围
-    augmentation_jitter_std: float = 0.005      # 减小抖动
-    augmentation_scale_range: Tuple[float, float] = (0.98, 1.02)  # 减小缩放范围
+    # ADDED: 添加回缺失的数据增强参数
+    augmentation_rotation_range: float = 0.05
+    augmentation_jitter_std: float = 0.005
+    augmentation_scale_range: Tuple[float, float] = (0.98, 1.02)
     
-    # 设备配置
+    # --- 运行配置 ---
     device: str = "cuda"
     num_workers: int = 4
-    
-    # 训练配置
-    save_interval: int = 5        # 保存检查点间隔
-    log_interval: int = 50         # 日志记录间隔
-    eval_interval: int = 1         # 验证间隔
+    save_interval: int = 5
+    log_interval: int = 50
+    eval_interval: int = 1
     
     # 输出路径
     checkpoint_dir: str = "checkpoints"

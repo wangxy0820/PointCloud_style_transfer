@@ -17,7 +17,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config_unsupervised import ConfigUnsupervised
 from models.diffusion_model_unsupervised import UnsupervisedPointCloudDiffusionModel, UnsupervisedDiffusionProcess
 from models.chunk_fusion import ImprovedChunkFusion
-from data.preprocessing import ImprovedPointCloudPreprocessor
+from data.preprocessing import PointCloudPreprocessor
 from utils.visualization import PointCloudVisualizer
 from utils.logger import Logger
 
@@ -43,7 +43,7 @@ class UnsupervisedDiffusionInference:
         self.chunk_fusion = ImprovedChunkFusion(overlap_ratio=self.config.overlap_ratio).to(self.device)
         
         # 预处理器
-        self.preprocessor = ImprovedPointCloudPreprocessor(
+        self.preprocessor = PointCloudPreprocessor(
             total_points=self.config.total_points,
             chunk_size=self.config.chunk_size,
             overlap_ratio=self.config.overlap_ratio
