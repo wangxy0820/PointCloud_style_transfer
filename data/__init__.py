@@ -1,12 +1,12 @@
 from .dataset import (
-    PointCloudStyleTransferDataset,
+    HierarchicalPointCloudDataset,
     create_dataloaders
 )
 from .preprocessing import PointCloudPreprocessor
 from .augmentation import PointCloudAugmentation
 
 __all__ = [
-    "PointCloudStyleTransferDataset",
+    "HierarchicalPointCloudDataset",
     "create_dataloaders",
     "PointCloudPreprocessor",
     "PointCloudAugmentation"

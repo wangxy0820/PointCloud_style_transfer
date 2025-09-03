@@ -1,13 +1,13 @@
-#version: '3.8'
+version: '3.8'
 
 services:
-  # GPU工作区间 - 完整开发环境
-  gpu-workspace:
+  # 主GPU工作环境
+  pointcloud-style-transfer:
     build:
       context: .
-      dockerfile: /docker/Dockerfile
-    container_name: gpu-workspace
-    hostname: gpu-server
+      dockerfile: Dockerfile
+    container_name: pointcloud-style-transfer
+    hostname: pc-style-server
     stdin_open: true
     tty: true
     
@@ -20,80 +20,75 @@ services:
               count: all
               capabilities: [gpu]
     
-    # 端口映射 - 可视化和服务
+    # 端口映射
     ports:
-      - "8887:8888"   # Jupyter Lab
-      - "6009:6006"   # TensorBoard
-      - "8081:8080"   # 可视化服务
-      - "5000:5000"   # Flask/Streamlit
-      - "8050:8050"   # Dash
-      - "8501:8501"   # Streamlit默认端口
-    
+      - "8888:8888"   # Jupyter Lab
+      - "6006:6006"   # TensorBoard
+      - "8080:8080"   # 可视化服务
+      - "5000:5000"   # Flask应用
+      - "8501:8501"   # Streamlit
+
     # 文件系统挂载
     volumes:
-      # 挂载你的主目录
-      - /home/ma23035:/host-home/ma23035
-      # 挂载整个home目录（备用）
-      - /home:/host-home
-      # 项目工作空间
+      # 项目代码
       - .:/workspace
-      # 系统级目录（可选）
-      - /tmp:/host-tmp
-      - /var/tmp:/host-var-tmp
-      # X11支持（可视化）
+      # 数据目录
+      - ./datasets:/workspace/datasets
+      - ./checkpoints:/workspace/checkpoints
+      - ./logs:/workspace/logs
+      - ./results:/workspace/results
+      # 主机home目录（可选）
+      - ${HOME}:/host-home
+      # X11支持（Linux GUI）
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - /dev/dri:/dev/dri
-    
+
     # 工作目录
     working_dir: /workspace
-    
+
     # 环境变量
     environment:
       - DISPLAY=${DISPLAY:-:0}
       - NVIDIA_VISIBLE_DEVICES=all
       - CUDA_VISIBLE_DEVICES=0
       - JUPYTER_ENABLE_LAB=yes
-      - PYTHONPATH=/workspace:/host-home/ma23035
+      - PYTHONPATH=/workspace
       - QT_X11_NO_MITSHM=1
-      - XAUTHORITY=/tmp/.docker.xauth
-    
+
     # 系统配置
     shm_size: 16g
     ulimits:
       memlock: -1
       stack: 67108864
-    
+
     # 网络
     networks:
-      - pointcloud-network
-    
+      - pointcloud-net
+
     # 启动命令
     command: /bin/bash
-    
+
     # 设备访问
     devices:
       - /dev/dri:/dev/dri
-    
-    # 特权模式（如果需要完整硬件访问）
-    privileged: false
-    
-    # 用户配置
+
+    # 用户配置（与宿主机用户一致）
     user: "1000:1000"
 
-  # 独立的Jupyter服务
-  jupyter-service:
+  # Jupyter Lab服务
+  jupyter:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: pointcloud-jupyter
+    container_name: pc-jupyter
     ports:
       - "8889:8888"
     volumes:
-      - /home/ma23035:/host-home/ma23035
       - .:/workspace
+      - ./datasets:/workspace/datasets
     environment:
       - JUPYTER_ENABLE_LAB=yes
-      - PYTHONPATH=/workspace:/host-home/ma23035
+      - PYTHONPATH=/workspace
     working_dir: /workspace
     command: >
       jupyter lab 
@@ -106,7 +101,7 @@ services:
       --ServerApp.allow_origin='*'
       --ServerApp.allow_remote_access=True
     networks:
-      - pointcloud-network
+      - pointcloud-net
     deploy:
       resources:
         reservations:
@@ -116,13 +111,12 @@ services:
               capabilities: [gpu]
 
   # TensorBoard服务
-  tensorboard-service:
+  tensorboard:
     image: tensorflow/tensorflow:latest-gpu
-    container_name: pointcloud-tensorboard
+    container_name: pc-tensorboard
     ports:
       - "6007:6006"
     volumes:
-      - /home/ma23035:/host-home/ma23035
       - ./logs:/logs
       - ./experiments:/experiments
     command: >
@@ -133,13 +127,32 @@ services:
       --bind_all
       --reload_interval=30
     networks:
-      - pointcloud-network
+      - pointcloud-net
+
+  # 开发数据库（可选 - 存储实验元数据）
+  mongodb:
+    image: mongo:6.0
+    container_name: pc-mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: pointcloud123
+    volumes:
+      - mongodb_data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - pointcloud-net
 
 networks:
-  pointcloud-network:
+  pointcloud-net:
     driver: bridge
 
-# 预设配置
+volumes:
+  mongodb_data:
+    driver: local
+
+# 预设配置模板
 x-gpu-config: &gpu-config
   deploy:
     resources:
@@ -150,10 +163,12 @@ x-gpu-config: &gpu-config
             capabilities: [gpu]
 
 x-common-volumes: &common-volumes
-  - /home/ma23035:/host-home/ma23035
   - .:/workspace
+  - ./datasets:/workspace/datasets
+  - ./checkpoints:/workspace/checkpoints
+  - ./logs:/workspace/logs
 
 x-common-env: &common-env
-  PYTHONPATH: /workspace:/host-home/ma23035
+  PYTHONPATH: /workspace
   NVIDIA_VISIBLE_DEVICES: all
   CUDA_VISIBLE_DEVICES: 0

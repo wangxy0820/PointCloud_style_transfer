@@ -3,7 +3,7 @@ import numpy as np
 from typing import Tuple
 
 class PointCloudAugmentation:
-    """点云数据增强 - 保持空间顺序"""
+    """点云数据增强"""
     
     def __init__(self,
                  rotation_range: float = 0.05,
@@ -59,7 +59,6 @@ class PointCloudAugmentation:
         augmented = self.random_jitter(augmented)
         augmented = self.random_scale(augmented)
         
-        # 关键：不再默认执行shuffle，除非显式开启
         augmented = self.shuffle_points_order(augmented)
         
         if is_single:
@@ -73,5 +72,5 @@ def create_lidar_augmentation(config):
         rotation_range=config.augmentation_rotation_range,
         jitter_std=config.augmentation_jitter_std,
         scale_range=config.augmentation_scale_range,
-        shuffle_points=False  # 明确禁用Shuffle
+        shuffle_points=False 
     )

@@ -13,9 +13,12 @@ WORKDIR /workspace
 # 更新系统并安装基础依赖
 RUN apt-get update && apt-get install -y \
     wget \
+    curl \
     git \
     build-essential \
     cmake \
+    pkg-config \
+    # 图形和显示相关
     libgl1-mesa-glx \
     libglib2.0-0 \
     libsm6 \
@@ -27,16 +30,30 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libxinerama1 \
     libxcursor1 \
+    libfontconfig1-dev \
+    # Python相关
     python3.11 \
     python3.11-dev \
+    python3.11-distutils \
     python3-pip \
+    # 开发工具
+    vim \
+    nano \
+    htop \
+    tree \
+    zip \
+    unzip \
+    # 网络工具
+    net-tools \
+    iputils-ping \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建python符号链接
-RUN ln -sf /usr/bin/python3.11 /usr/bin/python
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python3
 
-# 升级pip
+# 升级pip和安装基础工具
 RUN python -m pip install --upgrade pip setuptools wheel
 
 # 安装PyTorch和CUDA 12.5兼容版本
@@ -48,151 +65,54 @@ COPY requirements.txt /workspace/requirements.txt
 # 安装Python依赖
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 安装额外的依赖
+# 安装点云处理相关的额外依赖
 RUN pip install \
+    # 开发和调试工具
     tensorboard \
     wandb \
     pytest \
+    pytest-cov \
     black \
     flake8 \
+    isort \
+    mypy \
+    # Jupyter环境
     ipython \
-    jupyter
+    jupyter \
+    jupyterlab \
+    # 性能分析
+    py-spy \
+    memory-profiler \
+    line-profiler
+
+# 安装Open3D的系统依赖
+RUN apt-get update && apt-get install -y \
+    libegl1-mesa \
+    libegl1-mesa-dev \
+    libgl1-mesa-dev \
+    libgles2-mesa-dev \
+    libosmesa6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 # 创建必要的目录
 RUN mkdir -p /workspace/datasets \
     /workspace/checkpoints \
     /workspace/logs \
     /workspace/experiments \
-    /workspace/results
+    /workspace/results \
+    /workspace/datasets/simulation \
+    /workspace/datasets/real_world \
+    /workspace/datasets/processed_hierarchical
 
 # 设置用户权限（避免权限问题）
-RUN useradd -m -u 1000 researcher && \
+RUN useradd -m -u 1000 -s /bin/bash researcher && \
     chown -R researcher:researcher /workspace
 
 # 切换到普通用户
 USER researcher
 
 # 暴露端口
-EXPOSE 6006 8888
+EXPOSE 6006 8888 8501 5000 8080
 
 # 设置启动命令
 CMD ["/bin/bash"]
-
-
-# docker/docker-compose.yml
-version: '3.8'
-
-services:
-  pointcloud-style-transfer:
-    build:
-      context: ../
-      dockerfile: docker/Dockerfile
-    image: pointcloud-style-transfer:latest
-    container_name: pointcloud-style-transfer
-    
-    # GPU支持
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    
-    # 环境变量
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - CUDA_VISIBLE_DEVICES=0,1,2,3  # 根据实际GPU数量调整
-      - PYTHONPATH=/workspace
-      - WANDB_API_KEY=${WANDB_API_KEY}  # 如果使用wandb
-      
-    # 卷挂载
-    volumes:
-      # 代码目录
-      - ../:/workspace
-      # 数据集（可以挂载到外部存储）
-      - ${DATA_DIR:-./datasets}:/workspace/datasets
-      # 检查点（持久化保存）
-      - ${CHECKPOINT_DIR:-./checkpoints}:/workspace/checkpoints
-      # 日志
-      - ${LOG_DIR:-./logs}:/workspace/logs
-      # 实验结果
-      - ${EXPERIMENT_DIR:-./experiments}:/workspace/experiments
-      
-    # 网络设置
-    networks:
-      - pcst-network
-    
-    # 端口映射
-    ports:
-      - "6006:6006"  # TensorBoard
-      - "8888:8888"  # Jupyter
-      
-    # 资源限制
-    shm_size: '16gb'  # 共享内存大小
-    
-    # 保持容器运行
-    stdin_open: true
-    tty: true
-    
-    # 健康检查
-    healthcheck:
-      test: ["CMD", "nvidia-smi"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    
-    # 自动重启
-    restart: unless-stopped
-
-  # TensorBoard服务（可选）
-  tensorboard:
-    image: tensorflow/tensorflow:latest-gpu
-    container_name: pointcloud-tensorboard
-    command: tensorboard --logdir=/logs --host=0.0.0.0
-    volumes:
-      - ${LOG_DIR:-./logs}:/logs:ro
-    ports:
-      - "6007:6006"
-    networks:
-      - pcst-network
-    restart: unless-stopped
-
-  # Jupyter服务（可选）
-  jupyter:
-    build:
-      context: ../
-      dockerfile: docker/Dockerfile
-    image: pointcloud-style-transfer:latest
-    container_name: pointcloud-jupyter
-    command: jupyter notebook --ip=0.0.0.0 --no-browser --allow-root
-    
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=0
-      - PYTHONPATH=/workspace
-      
-    volumes:
-      - ../:/workspace
-      - ${DATA_DIR:-./datasets}:/workspace/datasets:ro
-      - ${CHECKPOINT_DIR:-./checkpoints}:/workspace/checkpoints:ro
-      
-    ports:
-      - "8889:8888"
-    
-    networks:
-      - pcst-network
-      
-    restart: unless-stopped
-
-networks:
-  pcst-network:
-    driver: bridge
-

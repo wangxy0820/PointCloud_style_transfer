@@ -1,3 +1,3 @@
-from .config_unsupervised import ConfigUnsupervised
+from .config import Config
 
 __all__ = ["Config"]

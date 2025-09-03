@@ -11,8 +11,7 @@ from tqdm import tqdm
 import json
 
 from models.diffusion_model import PointCloudDiffusionModel, DiffusionProcess
-from models.pointnet2_encoder import ImprovedPointNet2Encoder
-from models.chunk_fusion import ImprovedChunkFusion
+from models.pointnet2_encoder import PointNet2Encoder
 from evaluation.metrics import PointCloudMetrics
 from utils.visualization import PointCloudVisualizer
 
@@ -46,7 +45,7 @@ class DiffusionTester:
             time_dim=self.config.time_embed_dim
         ).to(self.device)
         
-        self.style_encoder = ImprovedPointNet2Encoder(
+        self.style_encoder = PointNet2Encoder(
             input_channels=3,
             feature_dim=1024
         ).to(self.device)
@@ -73,8 +72,6 @@ class DiffusionTester:
             device=self.device
         )
         
-        # 块融合
-        self.chunk_fusion = ImprovedChunkFusion(overlap_ratio=self.config.overlap_ratio)
     
     @torch.no_grad()
     def test(self, test_loader, compute_all_metrics: bool = True,

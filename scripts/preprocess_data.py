@@ -1,3 +1,5 @@
+# scripts/preprocess_data.py
+
 import os
 import sys
 import argparse
@@ -10,6 +12,7 @@ from sklearn.model_selection import train_test_split
 # 确保可以正确导入data包
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 导入分层预处理器
 from data.preprocessing import PointCloudPreprocessor
 
 def load_point_cloud(file_path: str) -> np.ndarray:
@@ -17,10 +20,13 @@ def load_point_cloud(file_path: str) -> np.ndarray:
     if file_path.endswith('.npy'):
         return np.load(file_path)
     elif file_path.endswith('.txt'):
-        return np.loadtxt(file_path)
+        # 增强对不同分隔符的兼容性
+        try:
+            return np.loadtxt(file_path, delimiter=',')
+        except ValueError:
+            return np.loadtxt(file_path, delimiter=' ')
     elif file_path.endswith('.pt'):
         data = torch.load(file_path, weights_only=False)
-        # 兼容不同格式的.pt文件
         if isinstance(data, torch.Tensor):
             return data.numpy()
         elif isinstance(data, np.ndarray):
@@ -30,16 +36,15 @@ def load_point_cloud(file_path: str) -> np.ndarray:
     else:
         raise ValueError(f"Unsupported file format: {file_path}")
 
-
 def main():
-    parser = argparse.ArgumentParser(description='Preprocess point cloud data with correct isotropic normalization')
+    parser = argparse.ArgumentParser(description='Preprocess point cloud data for hierarchical model')
     parser.add_argument('--sim_dir', type=str, required=True, help='Simulation data directory')
     parser.add_argument('--real_dir', type=str, required=True, help='Real world data directory')
-    parser.add_argument('--output_dir', type=str, default='datasets/processed', 
-                       help='Output directory for processed data')
-    parser.add_argument('--chunk_size', type=int, default=4096, help='Chunk size')
-    parser.add_argument('--overlap_ratio', type=float, default=0.2, help='Overlap ratio between chunks')
+    # 输出目录应与config中的 processed_data_dir 保持一致
+    parser.add_argument('--output_dir', type=str, default='datasets/processed_hierarchical', 
+                       help='Output directory for processed hierarchical data')
     parser.add_argument('--total_points', type=int, default=120000, help='Total points per point cloud for resampling')
+    parser.add_argument('--global_points', type=int, default=30000, help='Number of points for global downsampling')
     parser.add_argument('--train_ratio', type=float, default=0.8, help='Training set ratio')
     
     args = parser.parse_args()
@@ -49,16 +54,15 @@ def main():
     for split in ['train', 'val', 'test']:
         os.makedirs(os.path.join(args.output_dir, split), exist_ok=True)
     
-    # --- FIXED: 移除了不再需要的 use_lidar_normalization 参数 ---
+    # 初始化分层预处理器
     preprocessor = PointCloudPreprocessor(
         total_points=args.total_points,
-        chunk_size=args.chunk_size,
-        overlap_ratio=args.overlap_ratio
+        global_points=args.global_points
     )
     
-    print("Preprocessing with correct isotropic normalization:")
-    print(f"  Chunk size: {args.chunk_size}")
-    print(f"  Overlap ratio: {args.overlap_ratio}")
+    print("Preprocessing for hierarchical model:")
+    print(f"  Total points: {args.total_points}")
+    print(f"  Global points (downsampled): {args.global_points}")
     
     # 获取文件列表
     sim_files = sorted(glob(os.path.join(args.sim_dir, '*')))
@@ -78,7 +82,6 @@ def main():
     val_test_ratio = 1.0 - train_val_ratio
     
     train_idx, temp_idx = train_test_split(indices, test_size=val_test_ratio, random_state=42, shuffle=True)
-    # 将剩余部分对半分给验证集和测试集
     val_idx, test_idx = train_test_split(temp_idx, test_size=0.5, random_state=42, shuffle=True)
     
     splits = {'train': train_idx, 'val': val_idx, 'test': test_idx}
@@ -92,25 +95,9 @@ def main():
                 sim_points = load_point_cloud(sim_files[idx])
                 real_points = load_point_cloud(real_files[idx])
                 
-                # 确保点数统一
-                if len(sim_points) != args.total_points:
-                    if len(sim_points) > args.total_points:
-                        indices_to_keep = np.random.choice(len(sim_points), args.total_points, replace=False)
-                        sim_points = sim_points[indices_to_keep]
-                    else:
-                        indices_to_add = np.random.choice(len(sim_points), args.total_points - len(sim_points), replace=True)
-                        sim_points = np.concatenate([sim_points, sim_points[indices_to_add]], axis=0)
-                
-                if len(real_points) != args.total_points:
-                    if len(real_points) > args.total_points:
-                        indices_to_keep = np.random.choice(len(real_points), args.total_points, replace=False)
-                        real_points = real_points[indices_to_keep]
-                    else:
-                        indices_to_add = np.random.choice(len(real_points), args.total_points - len(real_points), replace=True)
-                        real_points = np.concatenate([real_points, real_points[indices_to_add]], axis=0)
-                
-                # 预处理并保存
-                preprocessor.save_preprocessed_data(
+                # 统一调用分层数据保存方法
+                # 这个方法内部会处理重采样、归一化、下采样和保存
+                preprocessor.save_hierarchical_data(
                     sim_points=sim_points,
                     real_points=real_points,
                     output_dir=os.path.join(args.output_dir, split_name),
@@ -123,13 +110,13 @@ def main():
     
     print(f"\nPreprocessing completed! Output saved to: {args.output_dir}")
     
+    # 保存预处理配置信息
     config_path = os.path.join(args.output_dir, 'preprocessing_config.json')
     import json
     with open(config_path, 'w') as f:
         json.dump({
-            'chunk_size': args.chunk_size,
-            'overlap_ratio': args.overlap_ratio,
             'total_points': args.total_points,
+            'global_points': args.global_points,
             'normalization_method': 'isotropic',
             'train_files': len(splits['train']),
             'val_files': len(splits['val']),

@@ -61,7 +61,6 @@ class Validator:
                 all_diffusion_losses.append(avg_diffusion_loss)
                 
                 # 2. 生成完整的点云用于评估质量
-                # 重要：我们在epoch 0时可能生成的基本是噪声，这是正常的
                 if num_inference_steps < diffusion_process.num_timesteps:
                     # DDIM采样（加速推理）
                     generated = self.stable_ddim_sample(
@@ -90,11 +89,11 @@ class Validator:
         # 4. 汇总指标
         aggregated_metrics = self.aggregate_metrics(all_metrics)
         
-        # 添加diffusion损失（这是主要的训练目标）
+        # 添加diffusion损失
         aggregated_metrics['val_diffusion_loss'] = np.mean(all_diffusion_losses)
         aggregated_metrics['val_diffusion_loss_std'] = np.std(all_diffusion_losses)
         
-        # 使用diffusion损失作为主要的验证损失（与训练一致）
+        # 使用diffusion损失作为主要的验证损失
         aggregated_metrics['val_loss'] = aggregated_metrics['val_diffusion_loss']
         
         return aggregated_metrics
@@ -135,7 +134,7 @@ class Validator:
             # 预测x0
             x0_pred = (x - torch.sqrt(1 - alpha_t) * predicted_noise) / (torch.sqrt(alpha_t) + 1e-8)
             
-            # 重要：限制x0的范围在合理区间内
+            # 限制x0的范围在合理区间内
             x0_pred = torch.clamp(x0_pred, -2, 2)
             
             # DDIM更新

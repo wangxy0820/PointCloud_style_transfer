@@ -1,26 +1,40 @@
+# models/diffusion_model.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-from typing import Tuple, Optional, List
 import math
+from typing import Tuple, Optional, Dict
+from tqdm import tqdm
+import numpy as np
+from sklearn.neighbors import NearestNeighbors
 
+from .pointnet2_encoder import PointNet2Encoder
+from config.config import Config
+
+# ================= 自适应层归一化 (AdaLN) 模块 =================
+class AdaLN(nn.Module):
+    def __init__(self, num_features, cond_feat_dim):
+        super().__init__()
+        # 使用一个线性层从条件特征中预测出缩放(scale)和偏移(bias)参数
+        self.projection = nn.Linear(cond_feat_dim, num_features * 2)
+        self.norm = nn.InstanceNorm1d(num_features) # 使用InstanceNorm更适合风格迁移
+
+    def forward(self, x, cond_feat):
+        # x: [B, C, N], cond_feat: [B, D]
+        params = self.projection(cond_feat).unsqueeze(-1) # -> [B, C*2, 1]
+        scale, bias = torch.chunk(params, 2, dim=1) # -> [B, C, 1], [B, C, 1]
+        
+        # 应用归一化和仿射变换
+        return self.norm(x) * (scale + 1) + bias
+# ===================================================================
 
 class TimeEmbedding(nn.Module):
-    """时间嵌入模块"""
-    
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
         
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        创建正弦时间嵌入
-        Args:
-            t: 时间步 [B]
-        Returns:
-            时间嵌入 [B, dim]
-        """
         device = t.device
         half_dim = self.dim // 2
         embeddings = math.log(10000) / (half_dim - 1)
@@ -29,383 +43,386 @@ class TimeEmbedding(nn.Module):
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
 
+class GlobalContextExtractor(nn.Module):
+    def __init__(self, feature_dim: int = 256):
+        super().__init__()
+        self.encoder = PointNet2Encoder(input_channels=3, feature_dim=feature_dim)
+        
+    def forward(self, points: torch.Tensor) -> torch.Tensor:
+        return self.encoder(points)
 
 class ResidualBlock(nn.Module):
-    """残差块with时间条件"""
-    
-    def __init__(self, in_channels: int, out_channels: int, time_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, 
+                 time_emb_dim: int, cond_feat_dim: int):
         super().__init__()
+        self.mlp_time = nn.Linear(time_emb_dim, out_channels)
+        
         self.conv1 = nn.Conv1d(in_channels, out_channels, 1)
         self.conv2 = nn.Conv1d(out_channels, out_channels, 1)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(time_channels, out_channels),
-            nn.SiLU()
-        )
-        self.norm1 = nn.GroupNorm(8, out_channels)
-        self.norm2 = nn.GroupNorm(8, out_channels)
-        self.act = nn.SiLU()
         
-        if in_channels != out_channels:
-            self.shortcut = nn.Conv1d(in_channels, out_channels, 1)
-        else:
-            self.shortcut = nn.Identity()
-    
-    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, C, N]
-            t: [B, time_channels]
-        """
+        # ================= 使用AdaLN替换旧的条件注入方式 =================
+        self.norm1 = AdaLN(out_channels, cond_feat_dim)
+        self.norm2 = nn.BatchNorm1d(out_channels) # 第二个norm保持不变
+        # =====================================================================
+        
+        self.silu = nn.SiLU()
+        self.shortcut = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, cond_feat: torch.Tensor) -> torch.Tensor:
         h = self.conv1(x)
-        h = self.norm1(h)
-        h = self.act(h)
         
-        # 添加时间信息
-        time_emb = self.time_mlp(t)
-        h = h + time_emb[:, :, None]
+        # ================= 应用AdaLN和时间嵌入 =================
+        h = self.norm1(h, cond_feat)
+        h = h + self.mlp_time(time_emb).unsqueeze(-1)
+        h = self.silu(h)
+        # ==========================================================
         
-        h = self.conv2(h)
-        h = self.norm2(h)
-        h = self.act(h)
-        
+        h = self.silu(self.norm2(self.conv2(h)))
         return h + self.shortcut(x)
 
-
-class CrossAttention(nn.Module):
-    """交叉注意力模块用于风格转换"""
-    
-    def __init__(self, dim: int, context_dim: int = 1024, heads: int = 8):
+class UNetBackbone(nn.Module):
+    def __init__(self, config: Config):
         super().__init__()
-        self.heads = heads
-        self.scale = (dim // heads) ** -0.5
+        self.config = config
         
-        self.to_q = nn.Linear(dim, dim)
-        self.to_k = nn.Linear(context_dim, dim)
-        self.to_v = nn.Linear(context_dim, dim)
-        self.to_out = nn.Linear(dim, dim)
+        self.init_conv = nn.Conv1d(3, 128, 1)
         
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        self.down1 = ResidualBlock(128, 256, config.time_embed_dim, config.feature_dim)
+        self.pool1 = nn.MaxPool1d(2)
+        self.down2 = ResidualBlock(256, 512, config.time_embed_dim, config.feature_dim)
+        self.pool2 = nn.MaxPool1d(2)
+        
+        self.mid = ResidualBlock(512, 512, config.time_embed_dim, config.feature_dim)
+        
+        self.up1_upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.up1_resblock = ResidualBlock(512 + 512, 256, config.time_embed_dim, config.feature_dim)
+        
+        self.up2_upsample = nn.Upsample(scale_factor=2, mode='nearest')
+        self.up2_resblock = ResidualBlock(256 + 256, 128, config.time_embed_dim, config.feature_dim)
+        
+        self.final_conv = nn.Sequential(
+            nn.Conv1d(128, 128, 1),
+            nn.SiLU(),
+            nn.Conv1d(128, 3, 1)
+        )
+
+    def forward(self, x: torch.Tensor, time_emb: torch.Tensor, cond_feat: torch.Tensor) -> torch.Tensor:
+        x = x.permute(0, 2, 1)
+        
+        h1 = self.init_conv(x)
+        h2 = self.down1(h1, time_emb, cond_feat)
+        p1 = self.pool1(h2)
+        
+        h3 = self.down2(p1, time_emb, cond_feat)
+        p2 = self.pool2(h3)
+        
+        h_mid = self.mid(p2, time_emb, cond_feat)
+        
+        h_up1 = self.up1_upsample(h_mid)
+        h_up1_in = torch.cat([h_up1, h3], dim=1)
+        h_up1_out = self.up1_resblock(h_up1_in, time_emb, cond_feat)
+        
+        h_up2 = self.up2_upsample(h_up1_out)
+        h_up2_in = torch.cat([h_up2, h2], dim=1)
+        h_up2_out = self.up2_resblock(h_up2_in, time_emb, cond_feat)
+        
+        output = self.final_conv(h_up2_out)
+        return output.permute(0, 2, 1)
+
+class LocalRefinementNetwork(nn.Module):
+    """局部细节恢复网络"""
+    def __init__(self, config: Config):
+        super().__init__()
+        self.chunk_size = config.chunk_size
+        
+        # 局部特征提取
+        self.local_encoder = nn.Sequential(
+            nn.Conv1d(3, 64, 1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 128, 1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 256, 1)
+        )
+        
+        # 细节生成
+        self.detail_generator = nn.Sequential(
+            nn.Conv1d(256 + 3, 128, 1),  # 特征 + 粗糙点
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 64, 1),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Conv1d(64, 3, 1)  # 输出残差
+        )
+        
+    def forward(self, coarse_points: torch.Tensor, 
+                original_structure: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: [B, N, C] - 内容特征
-            context: [B, M, context_dim] - 风格特征
+            coarse_points: [B, N, 3] - 转换后的粗糙点云
+            original_structure: [B, N, 3] - 原始结构信息
+        Returns:
+            refined_points: [B, N, 3] - 细化后的点云
         """
-        B, N, C = x.shape
+        B, N, _ = coarse_points.shape
         
-        q = self.to_q(x)
-        k = self.to_k(context)
-        v = self.to_v(context)
+        # 提取局部特征
+        local_feat = self.local_encoder(original_structure.permute(0, 2, 1))  # [B, 256, N]
         
-        # 多头注意力
-        q = q.reshape(B, N, self.heads, C // self.heads).transpose(1, 2)
-        k = k.reshape(B, -1, self.heads, C // self.heads).transpose(1, 2)
-        v = v.reshape(B, -1, self.heads, C // self.heads).transpose(1, 2)
+        # 拼接特征和粗糙点
+        combined = torch.cat([local_feat, coarse_points.permute(0, 2, 1)], dim=1)  # [B, 259, N]
         
-        # 计算注意力
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
+        # 生成细节残差
+        residual = self.detail_generator(combined).permute(0, 2, 1)  # [B, N, 3]
         
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).reshape(B, N, C)
+        # 添加残差
+        refined_points = coarse_points + residual * 0.1  # 缩放残差避免过大变化
         
-        return self.to_out(out)
-
+        return refined_points
 
 class PointCloudDiffusionModel(nn.Module):
-    """点云Diffusion模型用于风格转换"""
-    
-    def __init__(self, 
-                 input_dim: int = 3,
-                 hidden_dims: List[int] = [128, 256, 512, 1024],
-                 time_dim: int = 256,
-                 context_dim: int = 1024,
-                 num_heads: int = 8):
+    """分层Diffusion模型主体"""
+    def __init__(self, config: Config):
         super().__init__()
+        self.config = config
         
         # 时间嵌入
-        self.time_embed = nn.Sequential(
-            TimeEmbedding(time_dim),
-            nn.Linear(time_dim, time_dim * 2),
-            nn.SiLU(),
-            nn.Linear(time_dim * 2, time_dim)
-        )
+        self.time_embedding = TimeEmbedding(config.time_embed_dim)
         
-        # 输入投影
-        self.input_proj = nn.Conv1d(input_dim, hidden_dims[0], 1)
+        # 全局处理分支（处理下采样的点云）
+        self.global_encoder = GlobalContextExtractor(feature_dim=config.feature_dim)
+        self.global_backbone = UNetBackbone(config)
         
-        # 编码器
-        self.encoder_blocks = nn.ModuleList()
-        self.encoder_attns = nn.ModuleList()
+        # 局部细化分支
+        self.local_refinement = LocalRefinementNetwork(config)
         
-        for i in range(len(hidden_dims) - 1):
-            self.encoder_blocks.append(
-                ResidualBlock(hidden_dims[i], hidden_dims[i+1], time_dim)
-            )
-            self.encoder_attns.append(
-                CrossAttention(hidden_dims[i+1], context_dim, num_heads)
-            )
+        # 下采样目标大小
+        self.downsample_size = 30000
         
-        # 中间块
-        self.middle_block = ResidualBlock(hidden_dims[-1], hidden_dims[-1], time_dim)
-        self.middle_attn = CrossAttention(hidden_dims[-1], context_dim, num_heads)
-        
-        # 解码器 - 正确的维度计算
-        self.decoder_blocks = nn.ModuleList()
-        self.decoder_attns = nn.ModuleList()
-        
-        # 解码器维度：
-        # hidden_dims = [128, 256, 512, 1024]
-        # 解码器0: 1024(来自middle) + 512(skip) = 1536 -> 512
-        # 解码器1: 512(来自decoder0) + 256(skip) = 768 -> 256  
-        # 解码器2: 256(来自decoder1) + 128(skip) = 384 -> 128
-        
-        for i in range(len(hidden_dims) - 1):
-            in_channels = hidden_dims[- (i + 1)] * 2  # 输入是前一层输出通道数的两倍
-            out_channels = hidden_dims[- (i + 2)]     # 输出通道数逐步减少
-            self.decoder_blocks.append(
-                ResidualBlock(in_channels, out_channels, time_dim)
-            )
-            self.decoder_attns.append(
-                CrossAttention(out_channels, context_dim, num_heads)
-            )
-        
-        # 输出投影
-        self.output_proj = nn.Sequential(
-            nn.Conv1d(hidden_dims[0], hidden_dims[0] // 2, 1),
-            nn.SiLU(),
-            nn.Conv1d(hidden_dims[0] // 2, input_dim, 1)
-        )
-        
-        # 打印架构信息
-        print("Model Architecture:")
-        print(f"  Input projection: {input_dim} -> {hidden_dims[0]}")
-        for i in range(len(hidden_dims) - 1):
-            print(f"  Encoder {i}: {hidden_dims[i]} -> {hidden_dims[i+1]}")
-        print(f"  Middle block: {hidden_dims[-1]} -> {hidden_dims[-1]}")
-        for i in range(len(hidden_dims) - 1):
-            in_channels = hidden_dims[- (i + 1)] * 2
-            out_channels = hidden_dims[- (i + 2)]
-            print(f"  Decoder {i}: {in_channels} -> {out_channels}")
-        print(f"  Output projection: {hidden_dims[0]} -> {input_dim}")
-        
-    def forward(self, 
-                x: torch.Tensor, 
-                t: torch.Tensor,
-                style_features: torch.Tensor) -> torch.Tensor:
-        """
+    def voxel_downsample(self, points: torch.Tensor, target_size: int = 30000) -> Tuple[torch.Tensor, Dict]:
+        """体素下采样
         Args:
-            x: 带噪声的点云 [B, N, 3]
-            t: 时间步 [B]
-            style_features: 风格特征 [B, M, context_dim]
+            points: [B, N, 3] - 原始点云
+            target_size: 目标点数
         Returns:
-            预测的噪声 [B, N, 3]
+            downsampled: [B, target_size, 3] - 下采样点云
+            info: 采样信息字典
         """
-        # 调试：检查输入形状
-        # print(f"Forward pass - Input x: {x.shape}")
         
-        # 准备输入
-        x = x.transpose(1, 2)  # [B, 3, N]
-        time_emb = self.time_embed(t)  # [B, time_dim]
-        
-        # 输入投影
-        h = self.input_proj(x)  # [B, 128, N]
-        
-        # 编码器
-        skip_connections = []
-        for i, (block, attn) in enumerate(zip(self.encoder_blocks, self.encoder_attns)):
-            h = block(h, time_emb)
-            # 交叉注意力用于风格转换
-            h_transpose = h.transpose(1, 2)  # [B, N, C]
-            h_attn = attn(h_transpose, style_features)
-            h = h + h_attn.transpose(1, 2)
-            skip_connections.append(h)
-            # print(f"Encoder {i}: {h.shape}")
-        
-        # 中间块
-        h = self.middle_block(h, time_emb)
-        h_transpose = h.transpose(1, 2)
-        h_attn = self.middle_attn(h_transpose, style_features)
-        h = h + h_attn.transpose(1, 2)
-        # print(f"Middle block: {h.shape}")
-        
-        # 解码器
-        for i, (block, attn) in enumerate(zip(self.decoder_blocks, self.decoder_attns)):
-            # 跳跃连接
-            skip = skip_connections[-(i+1)]
-            h = torch.cat([h, skip], dim=1)
-            # print(f"Decoder {i} - after concat: {h.shape}, block expects: {block.conv1.in_channels}")
+        with torch.no_grad():
+            B, N, _ = points.shape
+            device = points.device
             
-            h = block(h, time_emb)
-            # 交叉注意力
-            h_transpose = h.transpose(1, 2)
-            h_attn = attn(h_transpose, style_features)
-            h = h + h_attn.transpose(1, 2)
+            downsampled_list = []
+            indices_list = []
+            
+            for b in range(B):
+                pts = points[b].cpu().numpy()
+                
+                # 计算体素大小
+                pts_min = pts.min(axis=0)
+                pts_max = pts.max(axis=0)
+                pts_range = pts_max - pts_min
+                voxel_size = (pts_range.prod() / target_size) ** (1/3) * 1.5
+                
+                # 体素化
+                voxel_dict = {}
+                for i, pt in enumerate(pts):
+                    voxel_key = tuple((pt / voxel_size).astype(int))
+                    if voxel_key not in voxel_dict:
+                        voxel_dict[voxel_key] = []
+                    voxel_dict[voxel_key].append(i)
+                
+                # 从每个体素选择代表点
+                selected_indices = []
+                for indices in voxel_dict.values():
+                    voxel_points = pts[indices]
+                    center = voxel_points.mean(axis=0)
+                    distances = np.linalg.norm(voxel_points - center, axis=1)
+                    selected_idx = indices[np.argmin(distances)]
+                    selected_indices.append(selected_idx)
+                
+                if len(selected_indices) < target_size:
+                    remaining = target_size - len(selected_indices)
+                    all_indices = set(range(N))
+                    available = list(all_indices - set(selected_indices))
+                    if available:
+                        extra = np.random.choice(available, min(remaining, len(available)), replace=False)
+                        selected_indices.extend(extra)
+                
+                if len(selected_indices) > target_size:
+                    selected_indices = np.random.choice(selected_indices, target_size, replace=False)
+                
+                selected_indices = np.array(selected_indices)
+                downsampled_pts = pts[selected_indices]
+                
+                downsampled_list.append(torch.from_numpy(downsampled_pts).float())
+                indices_list.append(selected_indices)
+            
+            downsampled = torch.stack(downsampled_list).to(device)
+            
+            return downsampled, {'indices': indices_list}
+    
+    def forward(self, noisy_points: torch.Tensor, time: torch.Tensor, 
+                condition_points: torch.Tensor, use_hierarchical: bool = True) -> torch.Tensor:
+        """
+        前向传播
+        """
+        if not use_hierarchical or noisy_points.shape[1] <= self.downsample_size:
+            time_emb = self.time_embedding(time)
+            cond_feat = self.global_encoder(condition_points)
+            return self.global_backbone(noisy_points, time_emb, cond_feat)
         
-        # 输出
-        out = self.output_proj(h)  # [B, 3, N]
-        out = out.transpose(1, 2)  # [B, N, 3]
+        # 分层处理
+        # 1. 下采样
+        noisy_down, down_info = self.voxel_downsample(noisy_points, self.downsample_size)
+        cond_down, _ = self.voxel_downsample(condition_points, self.downsample_size)
         
-        return out
+        # 2. 全局处理
+        time_emb = self.time_embedding(time)
+        cond_feat = self.global_encoder(cond_down)
+        denoised_coarse = self.global_backbone(noisy_down, time_emb, cond_feat)
+        
+        # 3. 上采样到原始大小
+        denoised_full = self.upsample_points(denoised_coarse, noisy_points, down_info)
+        
+        # 4. 局部细化
+        refined = self.local_refinement(denoised_full, noisy_points)
+        
+        return refined
+    
+    def upsample_points(self, coarse_points: torch.Tensor, 
+                        original_points: torch.Tensor, 
+                        down_info: Dict) -> torch.Tensor:
+        
+        """将粗糙点云上采样到原始大小"""
+        B, N, _ = original_points.shape
+        device = coarse_points.device
+        upsampled = torch.zeros_like(original_points)
+        
+        for b in range(B):
+            indices = down_info['indices'][b]
+            
+            # 使用 .detach() 来断开梯度连接
+            coarse_b = coarse_points[b].cpu().detach().numpy()
+            original_b = original_points[b].cpu().detach().numpy()
+            
+            result = np.zeros_like(original_b)
+            result[indices] = coarse_b
+            
+            all_indices = set(range(N))
+            unsampled = list(all_indices - set(indices))
+            
+            if unsampled:
+                nbrs = NearestNeighbors(n_neighbors=3, algorithm='auto').fit(original_b[indices])
+                distances, neighbors = nbrs.kneighbors(original_b[unsampled])
+                
+                weights = 1.0 / (distances + 1e-8)
+                weights = weights / weights.sum(axis=1, keepdims=True)
+                
+                # 获取 coarse_b 中对应的邻居点
+                interpolated_points = np.sum(coarse_b[neighbors] * weights[:, :, np.newaxis], axis=1)
+                result[unsampled] = interpolated_points
 
+            upsampled[b] = torch.from_numpy(result).float().to(device)
+        
+        return upsampled
 
 class DiffusionProcess:
-    """Diffusion过程管理"""
-    
-    def __init__(self, 
-                 num_timesteps: int = 1000,
-                 beta_schedule: str = "cosine",
-                 device: str = "cuda"):
-        self.num_timesteps = num_timesteps
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        
-        # 创建beta调度
-        if beta_schedule == "cosine":
-            self.betas = self._cosine_beta_schedule(num_timesteps).to(self.device)
+    """Diffusion过程管理器"""
+    def __init__(self, config: Config, device: str = 'cuda'):
+        self.num_timesteps = config.num_timesteps
+        self.device = device
+        self.betas = self._get_beta_schedule(config.beta_schedule, config.noise_schedule_offset).to(device)
+        self.alphas = 1. - self.betas
+        self.alphas_cumprod = torch.cumprod(self.alphas, axis=0)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - self.alphas_cumprod)
+        self.sqrt_recip_alphas_cumprod = torch.sqrt(1. / self.alphas_cumprod)
+        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1. / self.alphas_cumprod - 1)
+
+    def _get_beta_schedule(self, schedule_name: str, offset: float = 0.0) -> torch.Tensor:
+        if schedule_name == "linear":
+            betas = torch.linspace(0.0001, 0.02, self.num_timesteps)
+        elif schedule_name == "cosine":
+            steps = self.num_timesteps + 1
+            x = torch.linspace(0, self.num_timesteps, steps)
+            alphas_cumprod = torch.cos(((x / self.num_timesteps) + 0.008 + offset) / 1.008 * torch.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            betas = torch.clip(betas, 0.0001, 0.9999)
         else:
-            self.betas = self._linear_beta_schedule(num_timesteps).to(self.device)
-        
-        # 预计算alpha值 - 确保所有张量都在正确的设备上
-        self.alphas = (1 - self.betas).to(self.device)
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0).to(self.device)
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0).to(self.device)
-        
-        # 预计算采样所需的系数
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod).to(self.device)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - self.alphas_cumprod).to(self.device)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas).to(self.device)
-        
-    def _linear_beta_schedule(self, timesteps: int) -> torch.Tensor:
-        beta_start = 0.0001
-        beta_end = 0.02
-        return torch.linspace(beta_start, beta_end, timesteps)
-    
-    def _cosine_beta_schedule(self, timesteps: int) -> torch.Tensor:
-        s = 0.008
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0.0001, 0.9999)
-    
-    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        前向扩散过程
-        Args:
-            x_start: 原始数据 [B, N, 3]
-            t: 时间步 [B]
-            noise: 噪声 [B, N, 3]
-        Returns:
-            带噪声的数据
-        """
+            raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+        return betas
+
+    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if noise is None:
             noise = torch.randn_like(x_start)
-        
-        # 确保索引在正确的设备上
-        device = x_start.device
-        t = t.to(device)
-        
-        # 获取对应时间步的系数
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].to(device)
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].to(device)
-        
-        # 添加维度以便广播
-        sqrt_alphas_cumprod_t = sqrt_alphas_cumprod_t[:, None, None]
-        sqrt_one_minus_alphas_cumprod_t = sqrt_one_minus_alphas_cumprod_t[:, None, None]
-        
-        return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
-    
+        t = torch.clamp(t, 0, self.num_timesteps - 1)
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[t].view(-1, 1, 1)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1)
+        noisy_points = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+        return noisy_points, noise
+
     @torch.no_grad()
-    def p_sample(self, model: nn.Module, x: torch.Tensor, t: torch.Tensor, 
-                 style_features: torch.Tensor) -> torch.Tensor:
-        """
-        反向采样步骤
-        Args:
-            model: 噪声预测模型
-            x: 当前带噪声的数据 [B, N, 3]
-            t: 时间步 [B]
-            style_features: 风格特征
-        Returns:
-            去噪后的数据
-        """
-        device = x.device
-        t = t.to(device)
-        
-        # 预测噪声
-        predicted_noise = model(x, t, style_features)
-        
-        # 获取系数并确保在正确的设备上
-        betas_t = self.betas[t].to(device)[:, None, None]
-        sqrt_recip_alphas_t = self.sqrt_recip_alphas[t].to(device)[:, None, None]
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[t].to(device)[:, None, None]
-        
-        mean = sqrt_recip_alphas_t * (x - betas_t / sqrt_one_minus_alphas_cumprod_t * predicted_noise)
-        
-        if t[0] > 0:
-            noise = torch.randn_like(x)
-            # 计算后验方差
-            alphas_cumprod_t = self.alphas_cumprod[t].to(device)[:, None, None]
-            alphas_cumprod_prev_t = self.alphas_cumprod_prev[t].to(device)[:, None, None]
-            posterior_variance_t = betas_t * (1 - alphas_cumprod_prev_t) / (1 - alphas_cumprod_t)
-            return mean + torch.sqrt(posterior_variance_t) * noise
-        else:
-            return mean
-    
-    @torch.no_grad()
-    def sample(self, model: nn.Module, shape: Tuple[int, ...], 
-               style_features: torch.Tensor) -> torch.Tensor:
-        """
-        完整的采样过程
-        Args:
-            model: 噪声预测模型
-            shape: 输出形状 (B, N, 3)
-            style_features: 风格特征
-        Returns:
-            生成的点云
-        """
-        device = next(model.parameters()).device
-        
-        # 从纯噪声开始
+    def ddim_sample_loop(self, model: PointCloudDiffusionModel, shape: Tuple, 
+                         condition_points: torch.Tensor, num_inference_steps: int = 50):
+        device = torch.device(self.device)
         x = torch.randn(shape, device=device)
+        timesteps = torch.linspace(self.num_timesteps - 1, 0, num_inference_steps, dtype=torch.long, device=device)
         
-        # 逐步去噪
-        for t in reversed(range(self.num_timesteps)):
+        use_hierarchical = shape[1] > 30000
+        
+        for i in tqdm(range(len(timesteps)), desc="DDIM Sampling"):
+            t = timesteps[i]
+            prev_t = timesteps[i+1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
             batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
-            x = self.p_sample(model, x, batch_t, style_features)
-        
+            predicted_noise = model(x, batch_t, condition_points, use_hierarchical=use_hierarchical)
+            alpha_t = self.alphas_cumprod[t]
+            alpha_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else torch.tensor(1.0, device=device)
+            
+            pred_x0 = (x - torch.sqrt(1. - alpha_t) * predicted_noise) / (torch.sqrt(alpha_t) + 1e-8)
+            
+            norm = torch.linalg.norm(pred_x0, dim=-1, keepdim=True)
+            pred_x0 = pred_x0 / torch.maximum(norm, torch.tensor(1.0, device=pred_x0.device))
+            
+            dir_xt = torch.sqrt(1. - alpha_t_prev) * predicted_noise
+            x_prev = torch.sqrt(alpha_t_prev) * pred_x0 + dir_xt
+            x = x_prev
         return x
 
-
-# 测试代码
-if __name__ == "__main__":
-    print("Testing Diffusion Model...")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 创建模型
-    model = PointCloudDiffusionModel(
-        input_dim=3,
-        hidden_dims=[128, 256, 512, 1024],
-        time_dim=256,
-        context_dim=1024,
-        num_heads=8
-    ).to(device)
-    
-    # 测试数据
-    batch_size = 2
-    num_points = 2048
-    x = torch.randn(batch_size, num_points, 3).to(device)
-    t = torch.randint(0, 1000, (batch_size,), device=device)
-    style_features = torch.randn(batch_size, 1, 1024).to(device)
-    
-    print(f"\nInput shapes:")
-    print(f"  x: {x.shape}")
-    print(f"  t: {t.shape}")
-    print(f"  style_features: {style_features.shape}")
-    
-    # 测试前向传播
-    model.eval()
-    with torch.no_grad():
-        output = model(x, t, style_features)
-        print(f"\nOutput shape: {output.shape}")
-        print("✓ Model test passed!")
+    @torch.no_grad()
+    def guided_sample_loop(self, model: PointCloudDiffusionModel, 
+                          source_points: torch.Tensor, condition_points: torch.Tensor, 
+                          num_inference_steps: int = 50, guidance_strength: float = 0.5):
+        device = torch.device(self.device)
+        shape = source_points.shape
+        start_timestep = int((1.0 - guidance_strength) * (self.num_timesteps - 1))
+        start_timestep = max(0, min(start_timestep, self.num_timesteps - 1))
+        t_start = torch.tensor([start_timestep], device=device).long()
+        noise = torch.randn_like(source_points)
+        x, _ = self.q_sample(source_points, t_start, noise)
+        timesteps = torch.linspace(start_timestep, 0, num_inference_steps).long().to(device)
+        
+        use_hierarchical = shape[1] > 30000
+        
+        for i in tqdm(range(len(timesteps)), desc="Guided Sampling"):
+            t = timesteps[i]
+            prev_t = timesteps[i+1] if i < len(timesteps) - 1 else torch.tensor(-1, device=device)
+            batch_t = torch.full((shape[0],), t, device=device, dtype=torch.long)
+            predicted_noise = model(x, batch_t, condition_points, use_hierarchical=use_hierarchical)
+            alpha_t = self.alphas_cumprod[t]
+            alpha_t_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else torch.tensor(1.0, device=device)
+            
+            pred_x0 = (x - torch.sqrt(1. - alpha_t) * predicted_noise) / (torch.sqrt(alpha_t) + 1e-8)
+            
+            norm = torch.linalg.norm(pred_x0, dim=-1, keepdim=True)
+            pred_x0 = pred_x0 / torch.maximum(norm, torch.tensor(1.0, device=pred_x0.device))
+            
+            dir_xt = torch.sqrt(1. - alpha_t_prev) * predicted_noise
+            x_prev = torch.sqrt(alpha_t_prev) * pred_x0 + dir_xt
+            x = x_prev
+        return x
