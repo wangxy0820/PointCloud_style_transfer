@@ -14,7 +14,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config.config import Config
 from models.diffusion_model import PointCloudDiffusionModel, DiffusionProcess
-from data.dataset import PointCloudStyleTransferDataset
+from data.dataset import HierarchicalPointCloudDataset
 from evaluation.metrics import PointCloudMetrics
 from utils.visualization import PointCloudVisualizer
 from torch.utils.data import DataLoader
@@ -289,11 +289,9 @@ def main():
     
     # 创建测试数据集
     print("Loading test dataset...")
-    test_dataset = PointCloudStyleTransferDataset(
-        data_dir=args.test_data,
-        split='test',
-        chunk_size=config.chunk_size,
-        augment=False
+    test_dataset = HierarchicalPointCloudDataset(
+        processed_dir = os.path.join(args.test_data, 'test'),
+        use_hierarchical=True
     )
     
     if args.num_samples > 0:

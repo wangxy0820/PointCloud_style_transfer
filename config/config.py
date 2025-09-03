@@ -8,7 +8,7 @@ import torch
 class Config:
     
     # 实验设置
-    experiment_name: str = "hierarchical_test"
+    experiment_name: str = "train"
     data_root: str = "datasets"
     processed_data_dir: str = os.path.join(data_root, "processed_hierarchical")
     log_dir: str = "logs"

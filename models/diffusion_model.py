@@ -16,16 +16,14 @@ from config.config import Config
 class AdaLN(nn.Module):
     def __init__(self, num_features, cond_feat_dim):
         super().__init__()
-        # 使用一个线性层从条件特征中预测出缩放(scale)和偏移(bias)参数
         self.projection = nn.Linear(cond_feat_dim, num_features * 2)
-        self.norm = nn.InstanceNorm1d(num_features) # 使用InstanceNorm更适合风格迁移
+        self.norm = nn.InstanceNorm1d(num_features)
 
     def forward(self, x, cond_feat):
         # x: [B, C, N], cond_feat: [B, D]
         params = self.projection(cond_feat).unsqueeze(-1) # -> [B, C*2, 1]
         scale, bias = torch.chunk(params, 2, dim=1) # -> [B, C, 1], [B, C, 1]
         
-        # 应用归一化和仿射变换
         return self.norm(x) * (scale + 1) + bias
 # ===================================================================
 
@@ -60,10 +58,8 @@ class ResidualBlock(nn.Module):
         self.conv1 = nn.Conv1d(in_channels, out_channels, 1)
         self.conv2 = nn.Conv1d(out_channels, out_channels, 1)
         
-        # ================= 使用AdaLN替换旧的条件注入方式 =================
         self.norm1 = AdaLN(out_channels, cond_feat_dim)
-        self.norm2 = nn.BatchNorm1d(out_channels) # 第二个norm保持不变
-        # =====================================================================
+        self.norm2 = nn.BatchNorm1d(out_channels)
         
         self.silu = nn.SiLU()
         self.shortcut = nn.Conv1d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
@@ -71,11 +67,9 @@ class ResidualBlock(nn.Module):
     def forward(self, x: torch.Tensor, time_emb: torch.Tensor, cond_feat: torch.Tensor) -> torch.Tensor:
         h = self.conv1(x)
         
-        # ================= 应用AdaLN和时间嵌入 =================
         h = self.norm1(h, cond_feat)
         h = h + self.mlp_time(time_emb).unsqueeze(-1)
         h = self.silu(h)
-        # ==========================================================
         
         h = self.silu(self.norm2(self.conv2(h)))
         return h + self.shortcut(x)
@@ -130,10 +124,12 @@ class UNetBackbone(nn.Module):
         return output.permute(0, 2, 1)
 
 class LocalRefinementNetwork(nn.Module):
-    """局部细节恢复网络"""
+    """局部细节恢复网络 - 完全基于分层策略"""
     def __init__(self, config: Config):
         super().__init__()
-        self.chunk_size = config.chunk_size
+
+        self.global_points = config.global_points  # 30000
+        self.total_points = config.total_points    # 120000
         
         # 局部特征提取
         self.local_encoder = nn.Sequential(
@@ -183,7 +179,7 @@ class LocalRefinementNetwork(nn.Module):
         return refined_points
 
 class PointCloudDiffusionModel(nn.Module):
-    """分层Diffusion模型主体"""
+    """Diffusion模型主体"""
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
@@ -198,19 +194,15 @@ class PointCloudDiffusionModel(nn.Module):
         # 局部细化分支
         self.local_refinement = LocalRefinementNetwork(config)
         
-        # 下采样目标大小
-        self.downsample_size = 30000
+        # 分层参数
+        self.downsample_size = config.global_points  # 30000
+        self.total_size = config.total_points        # 120000
         
-    def voxel_downsample(self, points: torch.Tensor, target_size: int = 30000) -> Tuple[torch.Tensor, Dict]:
-        """体素下采样
-        Args:
-            points: [B, N, 3] - 原始点云
-            target_size: 目标点数
-        Returns:
-            downsampled: [B, target_size, 3] - 下采样点云
-            info: 采样信息字典
-        """
-        
+    def voxel_downsample(self, points: torch.Tensor, target_size: int = None) -> Tuple[torch.Tensor, Dict]:
+        """体素下采样 - 分层策略的核心"""
+        if target_size is None:
+            target_size = self.downsample_size
+            
         with torch.no_grad():
             B, N, _ = points.shape
             device = points.device
@@ -268,14 +260,15 @@ class PointCloudDiffusionModel(nn.Module):
     def forward(self, noisy_points: torch.Tensor, time: torch.Tensor, 
                 condition_points: torch.Tensor, use_hierarchical: bool = True) -> torch.Tensor:
         """
-        前向传播
+        前向传播 - 纯分层策略
         """
         if not use_hierarchical or noisy_points.shape[1] <= self.downsample_size:
+            # 非分层模式或点数已经较少
             time_emb = self.time_embedding(time)
             cond_feat = self.global_encoder(condition_points)
             return self.global_backbone(noisy_points, time_emb, cond_feat)
         
-        # 分层处理
+        # 分层处理模式
         # 1. 下采样
         noisy_down, down_info = self.voxel_downsample(noisy_points, self.downsample_size)
         cond_down, _ = self.voxel_downsample(condition_points, self.downsample_size)
@@ -296,8 +289,7 @@ class PointCloudDiffusionModel(nn.Module):
     def upsample_points(self, coarse_points: torch.Tensor, 
                         original_points: torch.Tensor, 
                         down_info: Dict) -> torch.Tensor:
-        
-        """将粗糙点云上采样到原始大小"""
+        """将粗糙点云上采样到原始大小 - 分层策略的逆过程"""
         B, N, _ = original_points.shape
         device = coarse_points.device
         upsampled = torch.zeros_like(original_points)
@@ -305,7 +297,6 @@ class PointCloudDiffusionModel(nn.Module):
         for b in range(B):
             indices = down_info['indices'][b]
             
-            # 使用 .detach() 来断开梯度连接
             coarse_b = coarse_points[b].cpu().detach().numpy()
             original_b = original_points[b].cpu().detach().numpy()
             
@@ -322,7 +313,6 @@ class PointCloudDiffusionModel(nn.Module):
                 weights = 1.0 / (distances + 1e-8)
                 weights = weights / weights.sum(axis=1, keepdims=True)
                 
-                # 获取 coarse_b 中对应的邻居点
                 interpolated_points = np.sum(coarse_b[neighbors] * weights[:, :, np.newaxis], axis=1)
                 result[unsampled] = interpolated_points
 
@@ -331,7 +321,7 @@ class PointCloudDiffusionModel(nn.Module):
         return upsampled
 
 class DiffusionProcess:
-    """Diffusion过程管理器"""
+    """Diffusion过程管理器 - 纯分层策略支持"""
     def __init__(self, config: Config, device: str = 'cuda'):
         self.num_timesteps = config.num_timesteps
         self.device = device
@@ -374,6 +364,7 @@ class DiffusionProcess:
         x = torch.randn(shape, device=device)
         timesteps = torch.linspace(self.num_timesteps - 1, 0, num_inference_steps, dtype=torch.long, device=device)
         
+        # 根据点云大小自动选择分层策略
         use_hierarchical = shape[1] > 30000
         
         for i in tqdm(range(len(timesteps)), desc="DDIM Sampling"):

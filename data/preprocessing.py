@@ -12,11 +12,23 @@ class PointCloudPreprocessor:
     def __init__(self, 
                  total_points: int = 120000,
                  global_points: int = 30000):
+        """
+        初始化分层预处理器
+        
+        Args:
+            total_points: 完整点云的目标点数
+            global_points: 全局下采样后的点数
+        """
         self.total_points = total_points
         self.global_points = global_points
+        
+        print(f"Initialized hierarchical preprocessor:")
+        print(f"  Total points: {self.total_points}")
+        print(f"  Global points: {self.global_points}")
+        print(f"  Compression ratio: {self.global_points/self.total_points:.2f}")
     
     def normalize_point_cloud(self, points: np.ndarray) -> Tuple[np.ndarray, dict]:
-        """归一化"""
+        """点云归一化 - 各向同性缩放"""
         center = points.mean(axis=0)
         points_centered = points - center
         
@@ -44,16 +56,20 @@ class PointCloudPreprocessor:
         return points_denorm
     
     def voxel_downsample(self, points: np.ndarray, target_size: int) -> Tuple[np.ndarray, np.ndarray]:
-        """体素下采样
-        返回:
+        """
+        体素下采样 - 分层策略的核心组件
+        
+        Args:
+            points: 输入点云 [N, 3]
+            target_size: 目标点数
+            
+        Returns:
             downsampled_points: 下采样后的点
             indices: 被选中点的原始索引
         """
         n_points = len(points)
-        #print(f"    [Voxel DEBUG] Starting downsample from {n_points} to {target_size} points.")
         
         if n_points <= target_size:
-            #print("    [Voxel DEBUG] Point count is already less than or equal to target. Returning original.")
             return points, np.arange(n_points)
         
         pts_min = points.min(axis=0)
@@ -62,19 +78,16 @@ class PointCloudPreprocessor:
         
         # 估算体素大小
         voxel_size = (pts_range.prod() / target_size) ** (1/3) * 1.2
-        #print(f"    [Voxel DEBUG] Estimated voxel size: {voxel_size:.4f}")
         
         # 体素化
-        #print("    [Voxel DEBUG] Building voxel dictionary...")
         voxel_dict = {}
         for i, pt in enumerate(points):
             voxel_key = tuple((pt / voxel_size).astype(int))
             if voxel_key not in voxel_dict:
                 voxel_dict[voxel_key] = []
             voxel_dict[voxel_key].append(i)
-        #print(f"    [Voxel DEBUG] Voxel dictionary built with {len(voxel_dict)} unique voxels.")
         
-        # 从每个体素选择代表点
+        # 从每个体素选择代表点（选择最接近体素中心的点）
         selected_indices = []
         for voxel_indices in voxel_dict.values():
             voxel_points = points[voxel_indices]
@@ -84,37 +97,32 @@ class PointCloudPreprocessor:
             selected_indices.append(selected_idx)
         
         selected_indices = np.array(selected_indices)
-        #print(f"    [Voxel DEBUG] Selected {len(selected_indices)} points from voxels.")
         
-        # 如果点数不够，使用FPS补充
+        # 如果点数不够，使用快速随机采样补充
         if len(selected_indices) < target_size:
             remaining_needed = target_size - len(selected_indices)
             all_indices = set(range(n_points))
-            # 获取所有未被选择的点的索引
             available_indices = list(all_indices - set(selected_indices))
             
             if available_indices and remaining_needed > 0:
-                #print(f"    [Voxel DEBUG] Points are not enough. Supplementing {remaining_needed} points using FAST random sampling.")
-                
-                # 从未被选择的点中，快速、随机地选择所需数量的点
                 num_to_sample = min(remaining_needed, len(available_indices))
                 extra_indices = np.random.choice(available_indices, num_to_sample, replace=False)
-                
-                # 将随机选出的点与之前体素中心选出的点合并
                 selected_indices = np.concatenate([selected_indices, extra_indices])
         
-        #rint(f"    [Voxel DEBUG] Total selected points before final adjustment: {len(selected_indices)}.")
         # 如果还是太多，随机采样到目标数量
         if len(selected_indices) > target_size:
-            #print("    [Voxel DEBUG] Points are too many. Randomly sampling down...")
             selected_indices = np.random.choice(selected_indices, target_size, replace=False)
         
-        #print(f"    [Voxel DEBUG] Downsample finished. Final point count: {len(selected_indices)}.")
         return points[selected_indices], selected_indices
     
     def create_hierarchical_data(self, points: np.ndarray) -> Dict:
-        """创建分层数据
-        返回:
+        """
+        创建分层数据结构 - 项目的核心数据表示
+        
+        Args:
+            points: 原始点云 [N, 3]
+            
+        Returns:
             包含完整点云和下采样点云的字典
         """
         # 归一化
@@ -124,8 +132,8 @@ class PointCloudPreprocessor:
         global_points, global_indices = self.voxel_downsample(points_norm, self.global_points)
         
         return {
-            'full_points': points_norm,  # [120000, 3]
-            'global_points': global_points,  # [30000, 3]
+            'full_points': points_norm,  # [total_points, 3]
+            'global_points': global_points,  # [global_points, 3]
             'global_indices': global_indices,  # 索引映射
             'norm_params': norm_params
         }
@@ -137,7 +145,6 @@ class PointCloudPreprocessor:
         
         # 确保点数正确
         if len(sim_points) != self.total_points:
-            # 重采样到目标点数
             if len(sim_points) > self.total_points:
                 indices = np.random.choice(len(sim_points), self.total_points, replace=False)
                 sim_points = sim_points[indices]
@@ -157,7 +164,7 @@ class PointCloudPreprocessor:
         sim_data = self.create_hierarchical_data(sim_points)
         real_data = self.create_hierarchical_data(real_points)
         
-        # 保存
+        # 保存完整的分层数据结构
         data = {
             'sim_full': sim_data['full_points'],
             'sim_global': sim_data['global_points'],
@@ -176,8 +183,3 @@ class PointCloudPreprocessor:
         
         print(f"Saved hierarchical data: full={self.total_points}, global={self.global_points}")
         return save_path
-    
-    # 兼容旧接口（但不使用）
-    def create_overlapping_chunks(self, points: np.ndarray):
-        """弃用 - 仅为兼容性保留"""
-        raise NotImplementedError("Chunks are deprecated. Use create_hierarchical_data instead.")
