@@ -101,11 +101,9 @@ class DiffusionInference:
             model_trainable_params = [p for p in model.parameters() if p.requires_grad]
             
             if len(ema_shadow_params) == len(model_trainable_params):
-                
                 with torch.no_grad():
                     for model_param, ema_param in zip(model_trainable_params, ema_shadow_params):
                         model_param.copy_(ema_param.to(self.device))
-                
                 self.logger.info("Successfully loaded EMA weights.")
             else:
                 self.logger.error("EMA weights mismatch. Falling back to standard weights.")
@@ -120,9 +118,9 @@ class DiffusionInference:
         self.logger.info("Model and config loaded successfully.")
         return config, model
 
-    @torch.no_grad() # 为整个推理函数添加 no_grad 装饰器
+    @torch.no_grad()
     def transfer_style_hierarchical(self, source_points: np.ndarray, reference_points: np.ndarray, 
-                                   num_steps: int, guidance_strength: float) -> np.ndarray:
+                                   num_steps: int, guidance_scale: float) -> np.ndarray: # MODIFIED
         self.logger.info(f"Starting hierarchical style transfer for {source_points.shape[0]} points")
         start_time = time.time()
         
@@ -137,7 +135,7 @@ class DiffusionInference:
             source_points=source_tensor,
             condition_points=ref_tensor,
             num_inference_steps=num_steps,
-            guidance_strength=guidance_strength
+            guidance_scale=guidance_scale # MODIFIED
         )
         
         transferred_norm = transferred.squeeze(0).cpu().numpy()
@@ -147,7 +145,7 @@ class DiffusionInference:
         return transferred_points
 
     def process_file(self, source_path: str, reference_path: str, output_path: str, 
-                     visualize: bool, num_steps: int, guidance_strength: float):
+                     visualize: bool, num_steps: int, guidance_scale: float): # MODIFIED
         self.logger.info(f"Processing source: {source_path}")
         
         sim_points = np.loadtxt(source_path, delimiter=',') if source_path.endswith('.txt') else np.load(source_path)
@@ -155,11 +153,10 @@ class DiffusionInference:
         
         self.logger.info(f"Using hierarchical processing for all inputs.")
         transferred_points = self.transfer_style_hierarchical(
-            sim_points, real_points, num_steps, guidance_strength
+            sim_points, real_points, num_steps, guidance_scale # MODIFIED
         )
         
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        # 保存为 .npy 格式以匹配输入
         np.save(output_path, transferred_points.astype(np.float32))
         self.logger.info(f"Transferred point cloud saved to: {output_path}")
 
@@ -183,8 +180,9 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to use')
     parser.add_argument('--visualize', action='store_true', help='Generate visualizations')
     parser.add_argument('--num_steps', type=int, default=50, help='Number of DDIM inference steps')
-    parser.add_argument('--guidance_strength', type=float, default=0.7, 
-                        help='Guidance strength (0.0 to 1.0). Higher means more style transfer.')
+    # MODIFIED: Renamed argument to match function definition
+    parser.add_argument('--guidance_scale', type=float, default=7.5, 
+                        help='Guidance scale (e.g., 3.0 to 10.0). Higher means more style transfer.')
     
     args = parser.parse_args()
     
@@ -192,7 +190,7 @@ def main():
         inference_engine = DiffusionInference(args.checkpoint, args.device)
         inference_engine.process_file(
             args.source, args.reference, args.output, 
-            args.visualize, args.num_steps, args.guidance_strength
+            args.visualize, args.num_steps, args.guidance_scale # MODIFIED
         )
         print("Inference completed successfully!")
     except Exception as e:

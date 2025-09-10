@@ -110,7 +110,7 @@ datasets/
 python scripts/preprocess_data.py \
     --sim_dir datasets/simulation \
     --real_dir datasets/real_world \
-    --output_dir datasets/processed_hierarchical \
+    --output_dir datasets/processed_hierarchical 
 ```
 
 ### 步骤3: 训练模型
@@ -158,6 +158,12 @@ python scripts/inference.py \
 python scripts/visualize_results.py \
     --original datasets/simulation/000000.npy \
     --generated results/000000.npy \
+    --reference datasets/real_world/000000.npy \
+    --output_path visualization.png
+    
+    python scripts/visualize_results.py \
+    --original datasets/simulation/000000.npy \
+    --generated datasets/simulation/000000.npy \
     --reference datasets/real_world/000000.npy \
     --output_path visualization.png
 ```
